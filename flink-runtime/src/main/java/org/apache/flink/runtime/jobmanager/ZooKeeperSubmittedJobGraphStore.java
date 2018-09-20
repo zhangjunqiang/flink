@@ -18,28 +18,30 @@
 
 package org.apache.flink.runtime.jobmanager;
 
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.runtime.state.RetrievableStateHandle;
+import org.apache.flink.runtime.zookeeper.RetrievableStateStorageHelper;
+import org.apache.flink.runtime.zookeeper.ZooKeeperStateHandleStore;
+import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.FlinkException;
+
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.recipes.cache.PathChildrenCache;
 import org.apache.curator.framework.recipes.cache.PathChildrenCacheEvent;
 import org.apache.curator.framework.recipes.cache.PathChildrenCacheListener;
 import org.apache.curator.utils.ZKPaths;
-import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.runtime.state.RetrievableStateHandle;
-import org.apache.flink.runtime.zookeeper.RetrievableStateStorageHelper;
-import org.apache.flink.runtime.zookeeper.ZooKeeperStateHandleStore;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import scala.Option;
 
+import javax.annotation.Nullable;
+
+import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.ConcurrentModificationException;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.Executor;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -67,13 +69,13 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 	/** Lock to synchronize with the {@link SubmittedJobGraphListener}. */
 	private final Object cacheLock = new Object();
 
-	/** Client (not a namespace facade) */
+	/** Client (not a namespace facade). */
 	private final CuratorFramework client;
 
 	/** The set of IDs of all added job graphs. */
 	private final Set<JobID> addedJobGraphs = new HashSet<>();
 
-	/** Completed checkpoints in ZooKeeper */
+	/** Submitted job graphs in ZooKeeper. */
 	private final ZooKeeperStateHandleStore<SubmittedJobGraph> jobGraphsInZooKeeper;
 
 	/**
@@ -82,6 +84,9 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 	 */
 	private final PathChildrenCache pathCache;
 
+	/** The full configured base path including the namespace. */
+	private final String zooKeeperFullBasePath;
+
 	/** The external listener to be notified on races. */
 	private SubmittedJobGraphListener jobGraphListener;
 
@@ -89,19 +94,17 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 	private boolean isRunning;
 
 	/**
-	 * Submitted job graph store backed by ZooKeeper
+	 * Submitted job graph store backed by ZooKeeper.
 	 *
 	 * @param client ZooKeeper client
 	 * @param currentJobsPath ZooKeeper path for current job graphs
 	 * @param stateStorage State storage used to persist the submitted jobs
-	 * @param executor to give to the ZooKeeperStateHandleStore to run ZooKeeper callbacks
 	 * @throws Exception
 	 */
 	public ZooKeeperSubmittedJobGraphStore(
 			CuratorFramework client,
 			String currentJobsPath,
-			RetrievableStateStorageHelper<SubmittedJobGraph> stateStorage,
-			Executor executor) throws Exception {
+			RetrievableStateStorageHelper<SubmittedJobGraph> stateStorage) throws Exception {
 
 		checkNotNull(currentJobsPath, "Current jobs path");
 		checkNotNull(stateStorage, "State storage");
@@ -117,7 +120,8 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 		// All operations will have the path as root
 		CuratorFramework facade = client.usingNamespace(client.getNamespace() + currentJobsPath);
 
-		this.jobGraphsInZooKeeper = new ZooKeeperStateHandleStore<>(facade, stateStorage, executor);
+		this.zooKeeperFullBasePath = client.getNamespace() + currentJobsPath;
+		this.jobGraphsInZooKeeper = new ZooKeeperStateHandleStore<>(facade, stateStorage);
 
 		this.pathCache = new PathChildrenCache(facade, "/", false);
 		pathCache.getListenable().addListener(new SubmittedJobGraphsPathCacheListener());
@@ -142,70 +146,80 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 			if (isRunning) {
 				jobGraphListener = null;
 
-				pathCache.close();
-
-				client.close();
-
-				isRunning = false;
-			}
-		}
-	}
-
-	@Override
-	public List<SubmittedJobGraph> recoverJobGraphs() throws Exception {
-		synchronized (cacheLock) {
-			verifyIsRunning();
-
-			List<Tuple2<RetrievableStateHandle<SubmittedJobGraph>, String>> submitted;
-
-			while (true) {
 				try {
-					submitted = jobGraphsInZooKeeper.getAll();
-					break;
+					Exception exception = null;
+
+					try {
+						jobGraphsInZooKeeper.releaseAll();
+					} catch (Exception e) {
+						exception = e;
+					}
+
+					try {
+						pathCache.close();
+					} catch (Exception e) {
+						exception = ExceptionUtils.firstOrSuppressed(e, exception);
+					}
+
+					if (exception != null) {
+						throw new FlinkException("Could not properly stop the ZooKeeperSubmittedJobGraphStore.", exception);
+					}
+				} finally {
+					isRunning = false;
 				}
-				catch (ConcurrentModificationException e) {
-					LOG.warn("Concurrent modification while reading from ZooKeeper. Retrying.");
-				}
-			}
-
-			if (submitted.size() != 0) {
-				List<SubmittedJobGraph> jobGraphs = new ArrayList<>(submitted.size());
-
-				for (Tuple2<RetrievableStateHandle<SubmittedJobGraph>, String> jobStateHandle : submitted) {
-					SubmittedJobGraph jobGraph = jobStateHandle.f0.retrieveState();
-					addedJobGraphs.add(jobGraph.getJobId());
-
-					jobGraphs.add(jobGraph);
-				}
-
-				LOG.info("Recovered {} job graphs: {}.", jobGraphs.size(), jobGraphs);
-				return jobGraphs;
-			}
-			else {
-				LOG.info("No job graph to recover.");
-				return Collections.emptyList();
 			}
 		}
 	}
 
 	@Override
-	public Option<SubmittedJobGraph> recoverJobGraph(JobID jobId) throws Exception {
+	@Nullable
+	public SubmittedJobGraph recoverJobGraph(JobID jobId) throws Exception {
 		checkNotNull(jobId, "Job ID");
-		String path = getPathForJob(jobId);
+		final String path = getPathForJob(jobId);
+
+		LOG.debug("Recovering job graph {} from {}{}.", jobId, zooKeeperFullBasePath, path);
 
 		synchronized (cacheLock) {
 			verifyIsRunning();
+
+			boolean success = false;
 
 			try {
-				SubmittedJobGraph jobGraph = jobGraphsInZooKeeper.get(path).retrieveState();
+				RetrievableStateHandle<SubmittedJobGraph> jobGraphRetrievableStateHandle;
+
+				try {
+					jobGraphRetrievableStateHandle = jobGraphsInZooKeeper.getAndLock(path);
+				} catch (KeeperException.NoNodeException ignored) {
+					success = true;
+					return null;
+				} catch (Exception e) {
+					throw new FlinkException("Could not retrieve the submitted job graph state handle " +
+						"for " + path + " from the submitted job graph store.", e);
+				}
+				SubmittedJobGraph jobGraph;
+
+				try {
+					jobGraph = jobGraphRetrievableStateHandle.retrieveState();
+				} catch (ClassNotFoundException cnfe) {
+					throw new FlinkException("Could not retrieve submitted JobGraph from state handle under " + path +
+						". This indicates that you are trying to recover from state written by an " +
+						"older Flink version which is not compatible. Try cleaning the state handle store.", cnfe);
+				} catch (IOException ioe) {
+					throw new FlinkException("Could not retrieve submitted JobGraph from state handle under " + path +
+						". This indicates that the retrieved state handle is broken. Try cleaning the state handle " +
+						"store.", ioe);
+				}
+
 				addedJobGraphs.add(jobGraph.getJobId());
 
 				LOG.info("Recovered {}.", jobGraph);
 
-				return Option.apply(jobGraph);
-			}
-			catch (KeeperException.NoNodeException ignored) {
-				return Option.empty();
+				success = true;
+				return jobGraph;
+			} finally {
+				if (!success) {
+					jobGraphsInZooKeeper.release(path);
+				}
 			}
 		}
 	}
@@ -214,6 +228,8 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 	public void putJobGraph(SubmittedJobGraph jobGraph) throws Exception {
 		checkNotNull(jobGraph, "Job graph");
 		String path = getPathForJob(jobGraph.getJobId());
+
+		LOG.debug("Adding job graph {} to {}{}.", jobGraph.getJobId(), zooKeeperFullBasePath, path);
 
 		boolean success = false;
 
@@ -225,11 +241,9 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 
 				if (currentVersion == -1) {
 					try {
-						jobGraphsInZooKeeper.add(path, jobGraph);
+						jobGraphsInZooKeeper.addAndLock(path, jobGraph);
 
 						addedJobGraphs.add(jobGraph.getJobId());
-
-						LOG.info("Added {} to ZooKeeper.", jobGraph);
 
 						success = true;
 					}
@@ -252,6 +266,8 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 				}
 			}
 		}
+
+		LOG.info("Added {} to ZooKeeper.", jobGraph);
 	}
 
 	@Override
@@ -259,14 +275,62 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 		checkNotNull(jobId, "Job ID");
 		String path = getPathForJob(jobId);
 
+		LOG.debug("Removing job graph {} from {}{}.", jobId, zooKeeperFullBasePath, path);
+
 		synchronized (cacheLock) {
 			if (addedJobGraphs.contains(jobId)) {
-				jobGraphsInZooKeeper.removeAndDiscardState(path);
-
-				addedJobGraphs.remove(jobId);
-				LOG.info("Removed job graph {} from ZooKeeper.", jobId);
+				if (jobGraphsInZooKeeper.releaseAndTryRemove(path)) {
+					addedJobGraphs.remove(jobId);
+				} else {
+					throw new FlinkException(String.format("Could not remove job graph with job id %s from ZooKeeper.", jobId));
+				}
 			}
 		}
+
+		LOG.info("Removed job graph {} from ZooKeeper.", jobId);
+	}
+
+	@Override
+	public void releaseJobGraph(JobID jobId) throws Exception {
+		checkNotNull(jobId, "Job ID");
+		final String path = getPathForJob(jobId);
+
+		LOG.debug("Releasing locks of job graph {} from {}{}.", jobId, zooKeeperFullBasePath, path);
+
+		synchronized (cacheLock) {
+			if (addedJobGraphs.contains(jobId)) {
+				jobGraphsInZooKeeper.release(path);
+
+				addedJobGraphs.remove(jobId);
+			}
+		}
+
+		LOG.info("Released locks of job graph {} from ZooKeeper.", jobId);
+	}
+
+	@Override
+	public Collection<JobID> getJobIds() throws Exception {
+		Collection<String> paths;
+
+		LOG.debug("Retrieving all stored job ids from ZooKeeper under {}.", zooKeeperFullBasePath);
+
+		try {
+			paths = jobGraphsInZooKeeper.getAllPaths();
+		} catch (Exception e) {
+			throw new Exception("Failed to retrieve entry paths from ZooKeeperStateHandleStore.", e);
+		}
+
+		List<JobID> jobIds = new ArrayList<>(paths.size());
+
+		for (String path : paths) {
+			try {
+				jobIds.add(jobIdfromPath(path));
+			} catch (Exception exception) {
+				LOG.warn("Could not parse job id from {}. This indicates a malformed path.", path, exception);
+			}
+		}
+
+		return jobIds;
 	}
 
 	/**
@@ -291,70 +355,80 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 			}
 
 			switch (event.getType()) {
-				case CHILD_ADDED:
+				case CHILD_ADDED: {
+					JobID jobId = fromEvent(event);
+
+					LOG.debug("Received CHILD_ADDED event notification for job {}", jobId);
+
 					synchronized (cacheLock) {
 						try {
-							JobID jobId = fromEvent(event);
 							if (jobGraphListener != null && !addedJobGraphs.contains(jobId)) {
 								try {
 									// Whoa! This has been added by someone else. Or we were fast
 									// to remove it (false positive).
 									jobGraphListener.onAddedJobGraph(jobId);
-								}
-								catch (Throwable t) {
+								} catch (Throwable t) {
 									LOG.error("Error in callback", t);
 								}
 							}
-						}
-						catch (Exception e) {
+						} catch (Exception e) {
 							LOG.error("Error in SubmittedJobGraphsPathCacheListener", e);
 						}
 					}
+				}
+				break;
 
-					break;
-
-				case CHILD_UPDATED:
+				case CHILD_UPDATED: {
 					// Nothing to do
-					break;
+				}
+				break;
 
-				case CHILD_REMOVED:
+				case CHILD_REMOVED: {
+					JobID jobId = fromEvent(event);
+
+					LOG.debug("Received CHILD_REMOVED event notification for job {}", jobId);
+
 					synchronized (cacheLock) {
 						try {
-							JobID jobId = fromEvent(event);
 							if (jobGraphListener != null && addedJobGraphs.contains(jobId)) {
 								try {
 									// Oh oh. Someone else removed one of our job graphs. Mean!
 									jobGraphListener.onRemovedJobGraph(jobId);
-								}
-								catch (Throwable t) {
+								} catch (Throwable t) {
 									LOG.error("Error in callback", t);
 								}
 							}
 
 							break;
-						}
-						catch (Exception e) {
+						} catch (Exception e) {
 							LOG.error("Error in SubmittedJobGraphsPathCacheListener", e);
 						}
 					}
-					break;
+				}
+				break;
 
-				case CONNECTION_SUSPENDED:
-					LOG.warn("ZooKeeper connection SUSPENDED. Changes to the submitted job " +
-							"graphs are not monitored (temporarily).");
-					break;
-				case CONNECTION_LOST:
+				case CONNECTION_SUSPENDED: {
+					LOG.warn("ZooKeeper connection SUSPENDING. Changes to the submitted job " +
+						"graphs are not monitored (temporarily).");
+				}
+				break;
+
+				case CONNECTION_LOST: {
 					LOG.warn("ZooKeeper connection LOST. Changes to the submitted job " +
-							"graphs are not monitored (permanently).");
-					break;
+						"graphs are not monitored (permanently).");
+				}
+				break;
 
-				case CONNECTION_RECONNECTED:
+				case CONNECTION_RECONNECTED: {
 					LOG.info("ZooKeeper connection RECONNECTED. Changes to the submitted job " +
-							"graphs are monitored again.");
-					break;
-				case INITIALIZED:
+						"graphs are monitored again.");
+				}
+				break;
+
+				case INITIALIZED: {
 					LOG.info("SubmittedJobGraphsPathCacheListener initialized");
-					break;
+				}
+				break;
 			}
 		}
 
@@ -381,4 +455,13 @@ public class ZooKeeperSubmittedJobGraphStore implements SubmittedJobGraphStore {
 		return String.format("/%s", jobId);
 	}
 
+	/**
+	 * Returns the JobID from the given path in ZooKeeper.
+	 *
+	 * @param path in ZooKeeper
+	 * @return JobID associated with the given path
+	 */
+	public static JobID jobIdfromPath(final String path) {
+		return JobID.fromHexString(path);
+	}
 }

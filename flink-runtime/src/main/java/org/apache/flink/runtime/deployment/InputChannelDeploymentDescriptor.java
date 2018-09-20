@@ -24,25 +24,21 @@ import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionEdge;
 import org.apache.flink.runtime.executiongraph.ExecutionGraphException;
 import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
-import org.apache.flink.runtime.instance.SimpleSlot;
 import org.apache.flink.runtime.io.network.ConnectionID;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.io.network.partition.consumer.InputChannel;
 import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate;
+import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.Serializable;
-import java.util.Arrays;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * Deployment descriptor for a single input channel instance.
  *
- * <p> Each input channel consumes a single subpartition. The index of the subpartition to consume
+ * <p>Each input channel consumes a single subpartition. The index of the subpartition to consume
  * is part of the {@link InputGateDeploymentDescriptor} as it is the same for each input channel of
  * the respective input gate.
  *
@@ -52,7 +48,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class InputChannelDeploymentDescriptor implements Serializable {
 
 	private static final long serialVersionUID = 373711381640454080L;
-	private static Logger LOG = LoggerFactory.getLogger(InputChannelDeploymentDescriptor.class);
 
 	/** The ID of the partition the input channel is going to consume. */
 	private final ResultPartitionID consumedPartitionId;
@@ -90,10 +85,9 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 	 */
 	public static InputChannelDeploymentDescriptor[] fromEdges(
 			ExecutionEdge[] edges,
-			SimpleSlot consumerSlot,
+			ResourceID consumerResourceId,
 			boolean allowLazyDeployment) throws ExecutionGraphException {
 
-		final ResourceID consumerTaskManager = consumerSlot.getTaskManagerID();
 		final InputChannelDeploymentDescriptor[] icdd = new InputChannelDeploymentDescriptor[edges.length];
 
 		// Each edge is connected to a different result partition
@@ -102,7 +96,7 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 			final Execution producer = consumedPartition.getProducer().getCurrentExecutionAttempt();
 
 			final ExecutionState producerState = producer.getState();
-			final SimpleSlot producerSlot = producer.getAssignedResource();
+			final LogicalSlot producerSlot = producer.getAssignedResource();
 
 			final ResultPartitionLocation partitionLocation;
 
@@ -112,11 +106,11 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 						producerState == ExecutionState.FINISHED ||
 						producerState == ExecutionState.SCHEDULED ||
 						producerState == ExecutionState.DEPLOYING)) {
-				
+
 				final TaskManagerLocation partitionTaskManagerLocation = producerSlot.getTaskManagerLocation();
 				final ResourceID partitionTaskManager = partitionTaskManagerLocation.getResourceID();
 
-				if (partitionTaskManager.equals(consumerTaskManager)) {
+				if (partitionTaskManager.equals(consumerResourceId)) {
 					// Consuming task is deployed to the same TaskManager as the partition => local
 					partitionLocation = ResultPartitionLocation.createLocal();
 				}
@@ -132,8 +126,21 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 			else if (allowLazyDeployment) {
 				// The producing task might not have registered the partition yet
 				partitionLocation = ResultPartitionLocation.createUnknown();
-			} else {
-				throw new ExecutionGraphException("Trying to eagerly schedule a task whose inputs are not ready.");
+			}
+			else if (producerState == ExecutionState.CANCELING
+						|| producerState == ExecutionState.CANCELED
+						|| producerState == ExecutionState.FAILED) {
+				String msg = "Trying to schedule a task whose inputs were canceled or failed. " +
+					"The producer is in state " + producerState + ".";
+				throw new ExecutionGraphException(msg);
+			}
+			else {
+				String msg = String.format("Trying to eagerly schedule a task whose inputs " +
+					"are not ready (partition consumable? %s, producer state: %s, producer slot: %s).",
+						consumedPartition.isConsumable(),
+						producerState,
+						producerSlot);
+				throw new ExecutionGraphException(msg);
 			}
 
 			final ResultPartitionID consumedPartitionId = new ResultPartitionID(
@@ -142,8 +149,6 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 			icdd[i] = new InputChannelDeploymentDescriptor(
 					consumedPartitionId, partitionLocation);
 		}
-
-		LOG.debug("Created {} from edges {}.", Arrays.toString(icdd), Arrays.toString(edges));
 
 		return icdd;
 	}

@@ -18,32 +18,41 @@
 
 package org.apache.flink.runtime.testingUtils
 
-import java.util.concurrent.{Executor, ExecutorService, TimeUnit, TimeoutException}
+import java.io.IOException
+import java.util.concurrent.{Executor, ScheduledExecutorService, TimeUnit, TimeoutException}
 
 import akka.actor.{ActorRef, ActorSystem, Props}
 import akka.pattern.Patterns._
 import akka.pattern.ask
 import akka.testkit.CallingThreadDispatcher
-import org.apache.flink.configuration.{ConfigConstants, Configuration}
+import org.apache.flink.api.common.JobID
+import org.apache.flink.configuration.{Configuration, JobManagerOptions}
 import org.apache.flink.runtime.akka.AkkaUtils
-import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory
+import org.apache.flink.runtime.blob.BlobServer
+import org.apache.flink.runtime.checkpoint.savepoint.Savepoint
+import org.apache.flink.runtime.checkpoint.{CheckpointOptions, CheckpointRecoveryFactory, CheckpointRetentionPolicy}
 import org.apache.flink.runtime.clusterframework.FlinkResourceManager
 import org.apache.flink.runtime.clusterframework.types.ResourceIDRetrievable
 import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager
 import org.apache.flink.runtime.executiongraph.restart.RestartStrategyFactory
-import org.apache.flink.runtime.instance.InstanceManager
+import org.apache.flink.runtime.highavailability.{HighAvailabilityServices, HighAvailabilityServicesUtils}
+import org.apache.flink.runtime.instance.{ActorGateway, InstanceManager}
 import org.apache.flink.runtime.jobmanager.scheduler.Scheduler
 import org.apache.flink.runtime.jobmanager.{JobManager, MemoryArchivist, SubmittedJobGraphStore}
 import org.apache.flink.runtime.leaderelection.LeaderElectionService
-import org.apache.flink.runtime.metrics.MetricRegistry
+import org.apache.flink.runtime.messages.JobManagerMessages
+import org.apache.flink.runtime.messages.JobManagerMessages._
+import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup
 import org.apache.flink.runtime.minicluster.LocalFlinkMiniCluster
 import org.apache.flink.runtime.taskmanager.TaskManager
+import org.apache.flink.runtime.testingUtils.TestingJobManagerMessages._
 import org.apache.flink.runtime.testingUtils.TestingMessages.Alive
 import org.apache.flink.runtime.testingUtils.TestingTaskManagerMessages.NotifyWhenRegisteredAtJobManager
 import org.apache.flink.runtime.testutils.TestingResourceManager
 
+import scala.concurrent.duration.Duration
 import scala.concurrent.duration.FiniteDuration
-import scala.concurrent.{Await, Future}
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 /**
  * Testing cluster which starts the [[JobManager]] and [[TaskManager]] actors with testing support
@@ -55,16 +64,35 @@ import scala.concurrent.{Await, Future}
  */
 class TestingCluster(
     userConfiguration: Configuration,
+    highAvailabilityServices: HighAvailabilityServices,
     singleActorSystem: Boolean,
     synchronousDispatcher: Boolean)
   extends LocalFlinkMiniCluster(
     userConfiguration,
+    highAvailabilityServices,
     singleActorSystem) {
 
-  def this(userConfiguration: Configuration, singleActorSystem: Boolean) =
-    this(userConfiguration, singleActorSystem, false)
+  def this(
+      userConfiguration: Configuration,
+      singleActorSystem: Boolean,
+      synchronousDispatcher: Boolean) = {
+    this(
+      userConfiguration,
+      HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(
+        userConfiguration,
+        ExecutionContext.global),
+      singleActorSystem,
+      synchronousDispatcher)
+  }
 
-  def this(userConfiguration: Configuration) = this(userConfiguration, true, false)
+  def this(userConfiguration: Configuration, singleActorSystem: Boolean) = {
+    this(
+      userConfiguration,
+      singleActorSystem,
+      false)
+  }
+
+  def this(userConfiguration: Configuration) = this(userConfiguration, true)
 
   // --------------------------------------------------------------------------
 
@@ -80,10 +108,11 @@ class TestingCluster(
   override def getJobManagerProps(
     jobManagerClass: Class[_ <: JobManager],
     configuration: Configuration,
-    futureExecutor: Executor,
+    futureExecutor: ScheduledExecutorService,
     ioExecutor: Executor,
     instanceManager: InstanceManager,
     scheduler: Scheduler,
+    blobServer: BlobServer,
     libraryCacheManager: BlobLibraryCacheManager,
     archive: ActorRef,
     restartStrategyFactory: RestartStrategyFactory,
@@ -92,7 +121,8 @@ class TestingCluster(
     submittedJobGraphStore: SubmittedJobGraphStore,
     checkpointRecoveryFactory: CheckpointRecoveryFactory,
     jobRecoveryTimeout: FiniteDuration,
-    metricsRegistry: Option[MetricRegistry]): Props = {
+    jobManagerMetricGroup: JobManagerMetricGroup,
+    optRestAddress: Option[String]): Props = {
 
     val props = super.getJobManagerProps(
       jobManagerClass,
@@ -101,6 +131,7 @@ class TestingCluster(
       ioExecutor,
       instanceManager,
       scheduler,
+      blobServer,
       libraryCacheManager,
       archive,
       restartStrategyFactory,
@@ -109,7 +140,8 @@ class TestingCluster(
       submittedJobGraphStore,
       checkpointRecoveryFactory,
       jobRecoveryTimeout,
-      metricsRegistry)
+      jobManagerMetricGroup,
+      optRestAddress)
 
     if (synchronousDispatcher) {
       props.withDispatcher(CallingThreadDispatcher.Id)
@@ -186,11 +218,11 @@ class TestingCluster(
           // restart the leading job manager with the same port
           val port = getLeaderRPCPort
           val oldPort = originalConfiguration.getInteger(
-            ConfigConstants.JOB_MANAGER_IPC_PORT_KEY,
+            JobManagerOptions.PORT,
             0)
 
           // we have to set the old port in the configuration file because this is used for startup
-          originalConfiguration.setInteger(ConfigConstants.JOB_MANAGER_IPC_PORT_KEY, port)
+          originalConfiguration.setInteger(JobManagerOptions.PORT, port)
 
           clearLeader()
 
@@ -198,8 +230,8 @@ class TestingCluster(
           Await.result(stopped, TestingCluster.MAX_RESTART_DURATION)
 
           if(!singleActorSystem) {
-            jmActorSystems(index).shutdown()
-            jmActorSystems(index).awaitTermination()
+            jmActorSystems(index).terminate()
+            Await.ready(jmActorSystems(index).whenTerminated, Duration.Inf)
           }
 
           val newJobManagerActorSystem = if(!singleActorSystem) {
@@ -209,9 +241,12 @@ class TestingCluster(
           }
 
           // reset the original configuration
-          originalConfiguration.setInteger(ConfigConstants.JOB_MANAGER_IPC_PORT_KEY, oldPort)
+          originalConfiguration.setInteger(JobManagerOptions.PORT, oldPort)
 
-          val newJobManagerActor = startJobManager(index, newJobManagerActorSystem)
+          val newJobManagerActor = startJobManager(
+            index,
+            newJobManagerActorSystem,
+            webMonitor.map(_.getRestAddress))
 
           jobManagerActors = Some(jmActors.patch(index, Seq(newJobManagerActor), 1))
           jobManagerActorSystems = Some(jmActorSystems.patch(
@@ -219,10 +254,13 @@ class TestingCluster(
             Seq(newJobManagerActorSystem),
             1))
 
-          val lrs = createLeaderRetrievalService()
+          jobManagerLeaderRetrievalService.foreach(_.stop())
 
-          jobManagerLeaderRetrievalService = Some(lrs)
-          lrs.start(this)
+          jobManagerLeaderRetrievalService = Option(
+            highAvailabilityServices.getJobManagerLeaderRetriever(
+              HighAvailabilityServices.DEFAULT_JOB_ID))
+
+          jobManagerLeaderRetrievalService.foreach(_.start(this))
 
         case _ => throw new Exception("The JobManager of the TestingCluster have not " +
                                         "been started properly.")
@@ -237,8 +275,8 @@ class TestingCluster(
         Await.result(stopped, TestingCluster.MAX_RESTART_DURATION)
 
         if(!singleActorSystem) {
-          tmActorSystems(index).shutdown()
-          tmActorSystems(index).awaitTermination()
+          tmActorSystems(index).terminate()
+          Await.ready(tmActorSystems(index).whenTerminated, Duration.Inf)
         }
 
         val taskManagerActorSystem  = if(!singleActorSystem) {
@@ -281,7 +319,121 @@ class TestingCluster(
       }
     }
   }
-}
+
+  @throws(classOf[IOException])
+  def triggerSavepoint(jobId: JobID): String = {
+    val timeout = AkkaUtils.getTimeout(configuration)
+    triggerSavepoint(jobId, getLeaderGateway(timeout), timeout)
+  }
+
+  @throws(classOf[IOException])
+  def requestSavepoint(savepointPath: String): Savepoint = {
+    val timeout = AkkaUtils.getTimeout(configuration)
+    requestSavepoint(savepointPath, getLeaderGateway(timeout), timeout)
+  }
+
+  @throws(classOf[IOException])
+  def disposeSavepoint(savepointPath: String): Unit = {
+    val timeout = AkkaUtils.getTimeout(configuration)
+    disposeSavepoint(savepointPath, getLeaderGateway(timeout), timeout)
+  }
+
+  @throws(classOf[IOException])
+  def triggerSavepoint(
+      jobId: JobID,
+      jobManager: ActorGateway,
+      timeout: FiniteDuration): String = {
+    val result = Await.result(
+      jobManager.ask(
+        TriggerSavepoint(jobId), timeout), timeout)
+
+    result match {
+      case success: TriggerSavepointSuccess => success.savepointPath
+      case fail: TriggerSavepointFailure => throw new IOException(fail.cause)
+      case _ => throw new IllegalStateException("Trigger savepoint failed")
+    }
+  }
+
+  @throws(classOf[IOException])
+  def requestSavepoint(
+      savepointPath: String,
+      jobManager: ActorGateway,
+      timeout: FiniteDuration): Savepoint = {
+    val result = Await.result(
+      jobManager.ask(
+        TestingJobManagerMessages.RequestSavepoint(savepointPath), timeout), timeout)
+
+    result match {
+      case success: ResponseSavepoint => success.savepoint
+      case _ => throw new IOException("Request savepoint failed")
+    }
+  }
+
+  @throws(classOf[IOException])
+  def disposeSavepoint(
+      savepointPath: String,
+      jobManager: ActorGateway,
+      timeout: FiniteDuration): Unit = {
+    val timeout = AkkaUtils.getTimeout(originalConfiguration)
+    val jobManager = getLeaderGateway(timeout)
+    val result = Await.result(jobManager.ask(DisposeSavepoint(savepointPath), timeout), timeout)
+    result match {
+      case DisposeSavepointSuccess =>
+      case _ => throw new IOException("Dispose savepoint failed")
+    }
+  }
+
+  @throws(classOf[IOException])
+  def requestCheckpoint(
+      jobId: JobID,
+      checkpointRetentionPolicy: CheckpointRetentionPolicy): String = {
+
+    val jobManagerGateway = getLeaderGateway(timeout)
+
+    // wait until the cluster is ready to take a checkpoint.
+    val allRunning = jobManagerGateway.ask(
+      TestingJobManagerMessages.WaitForAllVerticesToBeRunning(jobId), timeout)
+
+    Await.ready(allRunning, timeout)
+
+    // trigger checkpoint
+    val result = Await.result(
+      jobManagerGateway.ask(CheckpointRequest(jobId, checkpointRetentionPolicy), timeout), timeout)
+
+    result match {
+      case success: CheckpointRequestSuccess => success.path
+      case fail: CheckpointRequestFailure => throw fail.cause
+      case _ => throw new IllegalStateException("Trigger checkpoint failed")
+    }
+  }
+
+  /**
+    * This cancels the given job and waits until it has been completely removed from
+    * the cluster.
+    *
+    * @param jobId identifying the job to cancel
+    * @throws Exception if something goes wrong
+    */
+  @throws[Exception]
+  def cancelJob(jobId: JobID): Unit = {
+    if (getCurrentlyRunningJobsJava.contains(jobId)) {
+      val jobManagerGateway = getLeaderGateway(timeout)
+      val jobRemoved = jobManagerGateway.ask(NotifyWhenJobRemoved(jobId), timeout)
+      val cancelFuture = jobManagerGateway.ask(new JobManagerMessages.CancelJob(jobId), timeout)
+      val result = Await.result(cancelFuture, timeout)
+
+      result match {
+        case CancellationFailure(_, cause) =>
+          throw new Exception("Cancellation failed", cause)
+        case _ => // noop
+      }
+
+      // wait until the job has been removed
+      Await.result(jobRemoved, timeout)
+    }
+    else throw new IllegalStateException("Job is not running")
+  }
+ }
 
 object TestingCluster {
   val MAX_RESTART_DURATION = new FiniteDuration(2, TimeUnit.MINUTES)

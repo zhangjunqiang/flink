@@ -23,18 +23,21 @@ import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.util.TestLogger;
+
 import org.junit.Assert;
 import org.junit.Test;
 
+/**
+ * Tests for {@link RestartStrategies}.
+ */
 public class RestartStrategyTest extends TestLogger {
 
 	/**
-	 * Tests that in a streaming use case where checkpointing is enabled, a
-	 * fixed delay with Integer.MAX_VALUE retries is instantiated if no other restart
-	 * strategy has been specified
+	 * Tests that in a streaming use case where checkpointing is enabled, there is no default strategy set on the
+	 * client side.
 	 */
 	@Test
-	public void testAutomaticRestartingWhenCheckpointing() throws Exception {
+	public void testFallbackStrategyOnClientSideWhenCheckpointingEnabled() throws Exception {
 		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 		env.enableCheckpointing(500);
 
@@ -47,13 +50,12 @@ public class RestartStrategyTest extends TestLogger {
 			jobGraph.getSerializedExecutionConfig().deserializeValue(getClass().getClassLoader()).getRestartStrategy();
 
 		Assert.assertNotNull(restartStrategy);
-		Assert.assertTrue(restartStrategy instanceof RestartStrategies.FixedDelayRestartStrategyConfiguration);
-		Assert.assertEquals(Integer.MAX_VALUE, ((RestartStrategies.FixedDelayRestartStrategyConfiguration) restartStrategy).getRestartAttempts());
+		Assert.assertTrue(restartStrategy instanceof RestartStrategies.FallbackRestartStrategyConfiguration);
 	}
 
 	/**
 	 * Checks that in a streaming use case where checkpointing is enabled and the number
-	 * of execution retries is set to 0, restarting is deactivated
+	 * of execution retries is set to 0, restarting is deactivated.
 	 */
 	@Test
 	public void testNoRestartingWhenCheckpointingAndExplicitExecutionRetriesZero() throws Exception {
@@ -94,7 +96,7 @@ public class RestartStrategyTest extends TestLogger {
 
 		Assert.assertNotNull(restartStrategy);
 		Assert.assertTrue(restartStrategy instanceof RestartStrategies.FixedDelayRestartStrategyConfiguration);
-		Assert.assertEquals(42, ((RestartStrategies.FixedDelayRestartStrategyConfiguration)restartStrategy).getRestartAttempts());
-		Assert.assertEquals(1337, ((RestartStrategies.FixedDelayRestartStrategyConfiguration)restartStrategy).getDelayBetweenAttemptsInterval().toMilliseconds());
+		Assert.assertEquals(42, ((RestartStrategies.FixedDelayRestartStrategyConfiguration) restartStrategy).getRestartAttempts());
+		Assert.assertEquals(1337, ((RestartStrategies.FixedDelayRestartStrategyConfiguration) restartStrategy).getDelayBetweenAttemptsInterval().toMilliseconds());
 	}
 }

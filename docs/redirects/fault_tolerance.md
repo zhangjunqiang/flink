@@ -1,7 +1,7 @@
 ---
 title: "Fault Tolerance"
 layout: redirect
-redirect: /setup/fault_tolerance.html
+redirect: /dev/stream/state/checkpointing.html
 permalink: /apis/streaming/fault_tolerance.html
 ---
 <!--

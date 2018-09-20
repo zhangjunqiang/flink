@@ -18,37 +18,47 @@
 
 package org.apache.flink.runtime.metrics.groups;
 
-import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.blob.BlobKey;
-import org.apache.flink.runtime.deployment.InputGateDeploymentDescriptor;
-import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
-import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
+import org.apache.flink.configuration.MetricOptions;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
-import org.apache.flink.runtime.executiongraph.JobInformation;
-import org.apache.flink.runtime.executiongraph.TaskInformation;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
-import org.apache.flink.runtime.metrics.MetricRegistry;
 import org.apache.flink.runtime.metrics.MetricRegistryConfiguration;
+import org.apache.flink.runtime.metrics.MetricRegistryImpl;
 import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
 import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
-import org.apache.flink.runtime.state.TaskStateHandles;
 import org.apache.flink.util.AbstractID;
-
-import org.apache.flink.util.SerializedValue;
 import org.apache.flink.util.TestLogger;
+
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
-import java.net.URL;
-import java.util.ArrayList;
-import java.util.Collection;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
+/**
+ * Tests for the {@link TaskManagerMetricGroup}.
+ */
 public class TaskManagerGroupTest extends TestLogger {
+
+	private MetricRegistryImpl registry;
+
+	@Before
+	public void setup() {
+		registry = new MetricRegistryImpl(MetricRegistryConfiguration.defaultMetricRegistryConfiguration());
+	}
+
+	@After
+	public void teardown() throws Exception {
+		if (registry != null) {
+			registry.shutdown().get();
+		}
+	}
 
 	// ------------------------------------------------------------------------
 	//  adding and removing jobs
@@ -56,18 +66,15 @@ public class TaskManagerGroupTest extends TestLogger {
 
 	@Test
 	public void addAndRemoveJobs() throws IOException {
-		MetricRegistry registry = new MetricRegistry(MetricRegistryConfiguration.defaultMetricRegistryConfiguration());
-
 		final TaskManagerMetricGroup group = new TaskManagerMetricGroup(
 				registry, "localhost", new AbstractID().toString());
-		
-		
+
 		final JobID jid1 = new JobID();
 		final JobID jid2 = new JobID();
-		
+
 		final String jobName1 = "testjob";
 		final String jobName2 = "anotherJob";
-		
+
 		final JobVertexID vertex11 = new JobVertexID();
 		final JobVertexID vertex12 = new JobVertexID();
 		final JobVertexID vertex13 = new JobVertexID();
@@ -78,90 +85,30 @@ public class TaskManagerGroupTest extends TestLogger {
 		final ExecutionAttemptID execution13 = new ExecutionAttemptID();
 		final ExecutionAttemptID execution21 = new ExecutionAttemptID();
 
-		TaskDeploymentDescriptor tdd1 = createTaskDeploymentDescriptor(
-			jid1, 
-			jobName1, 
-			vertex11, 
-			execution11, 
-			new SerializedValue<>(new ExecutionConfig()), 
-			"test", 
-			18, 17, 18, 0,
-			new Configuration(), new Configuration(), 
-			"", 
-			new ArrayList<ResultPartitionDeploymentDescriptor>(), 
-			new ArrayList<InputGateDeploymentDescriptor>(), 
-			new ArrayList<BlobKey>(), 
-			new ArrayList<URL>(), 0);
-
-		TaskDeploymentDescriptor tdd2 = createTaskDeploymentDescriptor(
-			jid1,
-			jobName1,
-			vertex12,
-			execution12,
-			new SerializedValue<>(new ExecutionConfig()),
-			"test",
-			18, 13, 18, 1,
-			new Configuration(), new Configuration(),
-			"",
-			new ArrayList<ResultPartitionDeploymentDescriptor>(),
-			new ArrayList<InputGateDeploymentDescriptor>(),
-			new ArrayList<BlobKey>(),
-			new ArrayList<URL>(), 0);
-
-		TaskDeploymentDescriptor tdd3 = createTaskDeploymentDescriptor(
-			jid2,
-			jobName2,
-			vertex21,
-			execution21,
-			new SerializedValue<>(new ExecutionConfig()),
-			"test",
-			18, 7, 18, 2,
-			new Configuration(), new Configuration(),
-			"",
-			new ArrayList<ResultPartitionDeploymentDescriptor>(),
-			new ArrayList<InputGateDeploymentDescriptor>(),
-			new ArrayList<BlobKey>(),
-			new ArrayList<URL>(), 0);
-
-		TaskDeploymentDescriptor tdd4 = createTaskDeploymentDescriptor(
-			jid1,
-			jobName1,
-			vertex13,
-			execution13,
-			new SerializedValue<>(new ExecutionConfig()),
-			"test",
-			18, 0, 18, 0,
-			new Configuration(), new Configuration(),
-			"",
-			new ArrayList<ResultPartitionDeploymentDescriptor>(),
-			new ArrayList<InputGateDeploymentDescriptor>(),
-			new ArrayList<BlobKey>(),
-			new ArrayList<URL>(), 0);
-		
 		TaskMetricGroup tmGroup11 = group.addTaskForJob(
 			jid1, jobName1, vertex11, execution11, "test", 17, 0);
 		TaskMetricGroup tmGroup12 = group.addTaskForJob(
 			jid1, jobName1, vertex12, execution12, "test", 13, 1);
 		TaskMetricGroup tmGroup21 = group.addTaskForJob(
 			jid2, jobName2, vertex21, execution21, "test", 7, 2);
-		
+
 		assertEquals(2, group.numRegisteredJobMetricGroups());
 		assertFalse(tmGroup11.parent().isClosed());
 		assertFalse(tmGroup12.parent().isClosed());
 		assertFalse(tmGroup21.parent().isClosed());
-		
+
 		// close all for job 2 and one from job 1
 		tmGroup11.close();
 		tmGroup21.close();
 		assertTrue(tmGroup11.isClosed());
 		assertTrue(tmGroup21.isClosed());
-		
+
 		// job 2 should be removed, job should still be there
 		assertFalse(tmGroup11.parent().isClosed());
 		assertFalse(tmGroup12.parent().isClosed());
 		assertTrue(tmGroup21.parent().isClosed());
 		assertEquals(1, group.numRegisteredJobMetricGroups());
-		
+
 		// add one more to job one
 		TaskMetricGroup tmGroup13 = group.addTaskForJob(
 			jid1, jobName1, vertex13, execution13, "test", 0, 0);
@@ -171,18 +118,14 @@ public class TaskManagerGroupTest extends TestLogger {
 		assertTrue(tmGroup11.parent().isClosed());
 		assertTrue(tmGroup12.parent().isClosed());
 		assertTrue(tmGroup13.parent().isClosed());
-		
-		assertEquals(0, group.numRegisteredJobMetricGroups());
 
-		registry.shutdown();
+		assertEquals(0, group.numRegisteredJobMetricGroups());
 	}
 
 	@Test
 	public void testCloseClosesAll() throws IOException {
-		MetricRegistry registry = new MetricRegistry(MetricRegistryConfiguration.defaultMetricRegistryConfiguration());
 		final TaskManagerMetricGroup group = new TaskManagerMetricGroup(
-				registry, "localhost", new AbstractID().toString());
-
+			registry, "localhost", new AbstractID().toString());
 
 		final JobID jid1 = new JobID();
 		final JobID jid2 = new JobID();
@@ -198,152 +141,50 @@ public class TaskManagerGroupTest extends TestLogger {
 		final ExecutionAttemptID execution12 = new ExecutionAttemptID();
 		final ExecutionAttemptID execution21 = new ExecutionAttemptID();
 
-		TaskDeploymentDescriptor tdd1 = createTaskDeploymentDescriptor(
-			jid1,
-			jobName1,
-			vertex11,
-			execution11,
-			new SerializedValue<>(new ExecutionConfig()),
-			"test",
-			18, 17, 18, 0,
-			new Configuration(), new Configuration(),
-			"",
-			new ArrayList<ResultPartitionDeploymentDescriptor>(),
-			new ArrayList<InputGateDeploymentDescriptor>(),
-			new ArrayList<BlobKey>(),
-			new ArrayList<URL>(), 0);
-
-		TaskDeploymentDescriptor tdd2 = createTaskDeploymentDescriptor(
-			jid1,
-			jobName1,
-			vertex12,
-			execution12,
-			new SerializedValue<>(new ExecutionConfig()),
-			"test",
-			18, 13, 18, 1,
-			new Configuration(), new Configuration(),
-			"",
-			new ArrayList<ResultPartitionDeploymentDescriptor>(),
-			new ArrayList<InputGateDeploymentDescriptor>(),
-			new ArrayList<BlobKey>(),
-			new ArrayList<URL>(), 0);
-
-		TaskDeploymentDescriptor tdd3 = createTaskDeploymentDescriptor(
-			jid2,
-			jobName2,
-			vertex21,
-			execution21,
-			new SerializedValue<>(new ExecutionConfig()),
-			"test",
-			18, 7, 18, 1,
-			new Configuration(), new Configuration(),
-			"",
-			new ArrayList<ResultPartitionDeploymentDescriptor>(),
-			new ArrayList<InputGateDeploymentDescriptor>(),
-			new ArrayList<BlobKey>(),
-			new ArrayList<URL>(), 0);
-
 		TaskMetricGroup tmGroup11 = group.addTaskForJob(
 			jid1, jobName1, vertex11, execution11, "test", 17, 0);
 		TaskMetricGroup tmGroup12 = group.addTaskForJob(
 			jid1, jobName1, vertex12, execution12, "test", 13, 1);
 		TaskMetricGroup tmGroup21 = group.addTaskForJob(
 			jid2, jobName2, vertex21, execution21, "test", 7, 1);
-		
+
 		group.close();
-		
+
 		assertTrue(tmGroup11.isClosed());
 		assertTrue(tmGroup12.isClosed());
 		assertTrue(tmGroup21.isClosed());
-
-		registry.shutdown();
 	}
-	
+
 	// ------------------------------------------------------------------------
 	//  scope name tests
 	// ------------------------------------------------------------------------
 
 	@Test
 	public void testGenerateScopeDefault() {
-		MetricRegistry registry = new MetricRegistry(MetricRegistryConfiguration.defaultMetricRegistryConfiguration());
 		TaskManagerMetricGroup group = new TaskManagerMetricGroup(registry, "localhost", "id");
 
-		assertArrayEquals(new String[] { "localhost", "taskmanager", "id" }, group.getScopeComponents());
+		assertArrayEquals(new String[]{"localhost", "taskmanager", "id"}, group.getScopeComponents());
 		assertEquals("localhost.taskmanager.id.name", group.getMetricIdentifier("name"));
-		registry.shutdown();
 	}
 
 	@Test
-	public void testGenerateScopeCustom() {
+	public void testGenerateScopeCustom() throws Exception {
 		Configuration cfg = new Configuration();
-		cfg.setString(ConfigConstants.METRICS_SCOPE_NAMING_TM, "constant.<host>.foo.<host>");
-		MetricRegistry registry = new MetricRegistry(MetricRegistryConfiguration.fromConfiguration(cfg));
+		cfg.setString(MetricOptions.SCOPE_NAMING_TM, "constant.<host>.foo.<host>");
+		MetricRegistryImpl registry = new MetricRegistryImpl(MetricRegistryConfiguration.fromConfiguration(cfg));
 		TaskManagerMetricGroup group = new TaskManagerMetricGroup(registry, "host", "id");
 
-		assertArrayEquals(new String[] { "constant", "host", "foo", "host" }, group.getScopeComponents());
+		assertArrayEquals(new String[]{"constant", "host", "foo", "host"}, group.getScopeComponents());
 		assertEquals("constant.host.foo.host.name", group.getMetricIdentifier("name"));
-		registry.shutdown();
+		registry.shutdown().get();
 	}
 
 	@Test
 	public void testCreateQueryServiceMetricInfo() {
-		MetricRegistry registry = new MetricRegistry(MetricRegistryConfiguration.defaultMetricRegistryConfiguration());
 		TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
 
 		QueryScopeInfo.TaskManagerQueryScopeInfo info = tm.createQueryServiceMetricInfo(new DummyCharacterFilter());
 		assertEquals("", info.scope);
 		assertEquals("id", info.taskManagerID);
-	}
-
-	private static TaskDeploymentDescriptor createTaskDeploymentDescriptor(
-		JobID jobId,
-		String jobName,
-		JobVertexID jobVertexId,
-		ExecutionAttemptID executionAttemptId,
-		SerializedValue<ExecutionConfig> serializedExecutionConfig,
-		String taskName,
-		int numberOfKeyGroups,
-		int subtaskIndex,
-		int parallelism,
-		int attemptNumber,
-		Configuration jobConfiguration,
-		Configuration taskConfiguration,
-		String invokableClassName,
-		Collection<ResultPartitionDeploymentDescriptor> producedPartitions,
-		Collection<InputGateDeploymentDescriptor> inputGates,
-		Collection<BlobKey> requiredJarFiles,
-		Collection<URL> requiredClasspaths,
-		int targetSlotNumber) throws IOException {
-
-		JobInformation jobInformation = new JobInformation(
-			jobId,
-			jobName,
-			serializedExecutionConfig,
-			jobConfiguration,
-			requiredJarFiles,
-			requiredClasspaths);
-
-		TaskInformation taskInformation = new TaskInformation(
-			jobVertexId,
-			taskName,
-			parallelism,
-			numberOfKeyGroups,
-			invokableClassName,
-			taskConfiguration);
-
-		SerializedValue<JobInformation> serializedJobInformation = new SerializedValue<>(jobInformation);
-		SerializedValue<TaskInformation> serializedJobVertexInformation = new SerializedValue<>(taskInformation);
-
-		return new TaskDeploymentDescriptor(
-			serializedJobInformation,
-			serializedJobVertexInformation,
-			executionAttemptId,
-			subtaskIndex,
-			attemptNumber,
-			targetSlotNumber,
-			new TaskStateHandles(),
-			producedPartitions,
-			inputGates);
-
 	}
 }

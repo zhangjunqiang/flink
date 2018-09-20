@@ -54,6 +54,15 @@ public class BinaryUnionNode extends TwoInputNode {
 	}
 
 	@Override
+	public void addOutgoingConnection(DagConnection connection) {
+		// ensure that union nodes have not more than one outgoing connection.
+		if (this.getOutgoingConnections() != null && this.getOutgoingConnections().size() > 0) {
+			throw new CompilerException("BinaryUnionNode may only have a single outgoing connection.");
+		}
+		super.addOutgoingConnection(connection);
+	}
+
+	@Override
 	public String getOperatorName() {
 		return "Union";
 	}
@@ -104,6 +113,8 @@ public class BinaryUnionNode extends TwoInputNode {
 			throw new CompilerException("BinaryUnionNode has more than one successor.");
 		}
 
+		boolean childrenSkippedDueToReplicatedInput = false;
+
 		// check if we have a cached version
 		if (this.cachedPlans != null) {
 			return this.cachedPlans;
@@ -143,7 +154,30 @@ public class BinaryUnionNode extends TwoInputNode {
 		
 		// create all candidates
 		for (PlanNode child1 : subPlans1) {
+
+			if (child1.getGlobalProperties().isFullyReplicated()) {
+				// fully replicated input is always locally forwarded if parallelism is not changed
+				if (dopChange1) {
+					// can not continue with this child
+					childrenSkippedDueToReplicatedInput = true;
+					continue;
+				} else {
+					this.input1.setShipStrategy(ShipStrategyType.FORWARD);
+				}
+			}
+
 			for (PlanNode child2 : subPlans2) {
+
+				if (child2.getGlobalProperties().isFullyReplicated()) {
+					// fully replicated input is always locally forwarded if parallelism is not changed
+					if (dopChange2) {
+						// can not continue with this child
+						childrenSkippedDueToReplicatedInput = true;
+						continue;
+					} else {
+						this.input2.setShipStrategy(ShipStrategyType.FORWARD);
+					}
+				}
 				
 				// check that the children go together. that is the case if they build upon the same
 				// candidate at the joined branch plan. 
@@ -246,6 +280,16 @@ public class BinaryUnionNode extends TwoInputNode {
 
 					instantiate(operator, c1, c2, broadcastPlanChannels, outputPlans, estimator, igps, igps, noLocalProps, noLocalProps);
 				}
+			}
+		}
+
+		if(outputPlans.isEmpty()) {
+			if(childrenSkippedDueToReplicatedInput) {
+				throw new CompilerException("No plan meeting the requirements could be created @ " + this
+					+ ". Most likely reason: Invalid use of replicated input.");
+			} else {
+				throw new CompilerException("No plan meeting the requirements could be created @ " + this
+					+ ". Most likely reason: Too restrictive plan hints.");
 			}
 		}
 

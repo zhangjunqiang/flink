@@ -58,10 +58,15 @@ public class ProcessingTimeTrigger extends Trigger<Object, TimeWindow> {
 	}
 
 	@Override
-	public TriggerResult onMerge(TimeWindow window,
+	public void onMerge(TimeWindow window,
 			OnMergeContext ctx) {
-		ctx.registerProcessingTimeTimer(window.maxTimestamp());
-		return TriggerResult.CONTINUE;
+		// only register a timer if the time is not yet past the end of the merged window
+		// this is in line with the logic in onElement(). If the time is past the end of
+		// the window onElement() will fire and setting a timer here would fire the window twice.
+		long windowMaxTimestamp = window.maxTimestamp();
+		if (windowMaxTimestamp > ctx.getCurrentProcessingTime()) {
+			ctx.registerProcessingTimeTimer(windowMaxTimestamp);
+		}
 	}
 
 	@Override

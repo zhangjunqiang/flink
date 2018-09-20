@@ -136,10 +136,7 @@ The first two do as the name suggests.
 Please refer to [Data Sinks](#data-sinks) for more information on writing to files.
 
 Once you specified the complete program you need to call `execute` on
-the `Environment`. This will either execute on your local machine or submit your program
-for execution on a cluster, depending on how Flink was started. You can force
-a local execution by using `execute(local=True)`.
-
+the `Environment`. This will submit your program for execution on a cluster.
 {% top %}
 
 Project setup
@@ -149,8 +146,7 @@ Apart from setting up Flink, no additional work is required. The python package 
 
 The Python API was tested on Linux/Windows systems that have Python 2.7 or 3.4 installed.
 
-By default Flink will start python processes by calling "python" or "python3", depending on which start-script
-was used. By setting the "python.binary.python[2/3]" key in the flink-conf.yaml you can modify this behaviour to use a binary of your choice.
+By default Flink will start python processes by calling "python". By setting the "python.binary.path" key in the flink-conf.yaml you can modify this behaviour to use a binary of your choice.
 
 {% top %}
 
@@ -160,8 +156,7 @@ Lazy Evaluation
 All Flink programs are executed lazily: When the program's main method is executed, the data loading
 and transformations do not happen directly. Rather, each operation is created and added to the
 program's plan. The operations are actually executed when one of the `execute()` methods is invoked
-on the Environment object. Whether the program is executed locally or on a cluster depends
-on the environment of the program.
+on the Environment object.
 
 The lazy evaluation lets you construct sophisticated programs that Flink executes as one
 holistically planned unit.
@@ -561,7 +556,7 @@ class MapperBcv(MapFunction):
         factor = self.context.get_broadcast_variable("bcv")[0][0]
         return value * factor
 
-# 1. The DataSet to be broadcasted
+# 1. The DataSet to be broadcast
 toBroadcast = env.from_elements(1, 2, 3)
 data = env.from_elements("a", "b")
 
@@ -570,7 +565,7 @@ data.map(MapperBcv()).with_broadcast_set("bcv", toBroadcast)
 {% endhighlight %}
 
 Make sure that the names (`bcv` in the previous example) match when registering and
-accessing broadcasted data sets.
+accessing broadcast data sets.
 
 **Note**: As the content of broadcast variables is kept in-memory on each node, it should not become
 too large. For simpler things like scalar values you can simply parameterize the rich function.
@@ -616,7 +611,7 @@ env.execute()
 
 A system-wide default parallelism for all execution environments can be defined by setting the
 `parallelism.default` property in `./conf/flink-conf.yaml`. See the
-[Configuration]({{ site.baseurl }}/setup/config.html) documentation for details.
+[Configuration]({{ site.baseurl }}/ops/config.html) documentation for details.
 
 {% top %}
 
@@ -624,12 +619,11 @@ Executing Plans
 ---------------
 
 To run the plan with Flink, go to your Flink distribution, and run the pyflink.sh script from the /bin folder.
-use pyflink2.sh for python 2.7, and pyflink3.sh for python 3.4. The script containing the plan has to be passed
-as the first argument, followed by a number of additional python packages, and finally, separated by - additional
-arguments that will be fed to the script.
+The script containing the plan has to be passed as the first argument, followed by a number of additional python
+packages, and finally, separated by - additional arguments that will be fed to the script.
 
 {% highlight python %}
-./bin/pyflink<2/3>.sh <Script>[ <pathToPackage1>[ <pathToPackageX]][ - <param1>[ <paramX>]]
+./bin/pyflink.sh <Script>[ <pathToPackage1>[ <pathToPackageX]][ - <param1>[ <paramX>]]
 {% endhighlight %}
 
 {% top %}

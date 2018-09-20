@@ -24,14 +24,16 @@ import java.util.concurrent.{Callable, TimeUnit}
 
 import akka.actor._
 import akka.pattern.{ask => akkaAsk}
-import com.typesafe.config.{Config, ConfigFactory, ConfigParseOptions, ConfigValueFactory}
+import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.flink.api.common.time.Time
-import org.apache.flink.configuration.{ConfigConstants, Configuration}
+import org.apache.flink.configuration.{AkkaOptions, Configuration, IllegalConfigurationException, SecurityOptions}
 import org.apache.flink.runtime.net.SSLUtils
 import org.apache.flink.util.NetUtils
+import org.jboss.netty.channel.ChannelException
 import org.jboss.netty.logging.{InternalLoggerFactory, Slf4JLoggerFactory}
-import org.slf4j.LoggerFactory
+import org.slf4j.{Logger, LoggerFactory}
 
+import scala.annotation.tailrec
 import scala.concurrent._
 import scala.concurrent.duration._
 import scala.language.postfixOps
@@ -42,9 +44,9 @@ import scala.language.postfixOps
  * actor systems resides in this class.
  */
 object AkkaUtils {
-  val LOG = LoggerFactory.getLogger(AkkaUtils.getClass)
+  val LOG: Logger = LoggerFactory.getLogger(AkkaUtils.getClass)
 
-  val INF_TIMEOUT = 21474835 seconds
+  val INF_TIMEOUT: FiniteDuration = 21474835 seconds
 
   /**
    * Creates a local actor system without remoting.
@@ -58,13 +60,30 @@ object AkkaUtils {
   }
 
   /**
+    * Creates an actor system bound to the given hostname and port.
+    *
+    * @param configuration instance containing the user provided configuration values
+    * @param hostname of the network interface to bind to
+    * @param port of to bind to
+    * @return created actor system
+    */
+  def createActorSystem(
+      configuration: Configuration,
+      hostname: String,
+      port: Int)
+    : ActorSystem = {
+
+    createActorSystem(configuration, Some((hostname, port)))
+  }
+
+  /**
    * Creates an actor system. If a listening address is specified, then the actor system will listen
    * on that address for messages from a remote actor system. If not, then a local actor system
    * will be instantiated.
    *
    * @param configuration instance containing the user provided configuration values
-   * @param listeningAddress an optional tuple containing a hostname and a port to bind to. If the
-   *                         parameter is None, then a local actor system will be created.
+   * @param listeningAddress an optional tuple containing a bindAddress and a port to bind to.
+    *                        If the parameter is None, then a local actor system will be created.
    * @return created actor system
    */
   def createActorSystem(
@@ -84,7 +103,7 @@ object AkkaUtils {
   def createActorSystem(akkaConfig: Config): ActorSystem = {
     // Initialize slf4j as logger of Akka's Netty instead of java.util.logging (FLINK-1650)
     InternalLoggerFactory.setDefaultFactory(new Slf4JLoggerFactory)
-    ActorSystem.create("flink", akkaConfig)
+    RobustActorSystem.create("flink", akkaConfig)
   }
 
   /**
@@ -98,25 +117,53 @@ object AkkaUtils {
   }
 
   /**
+    * Return a remote Akka config for the given configuration values.
+    *
+    * @param configuration containing the user provided configuration values
+    * @param hostname to bind against. If null, then the loopback interface is used
+    * @param port to bind against
+    * @return A remote Akka config
+    */
+  def getAkkaConfig(configuration: Configuration,
+                    hostname: String,
+                    port: Int): Config = {
+    getAkkaConfig(configuration, Some((hostname, port)))
+  }
+
+  /**
+    * Return a local Akka config for the given configuration values.
+    *
+    * @param configuration containing the user provided configuration values
+    * @return A local Akka config
+    */
+  def getAkkaConfig(configuration: Configuration): Config = {
+    getAkkaConfig(configuration, None)
+  }
+
+  /**
    * Creates an akka config with the provided configuration values. If the listening address is
    * specified, then the actor system will listen on the respective address.
    *
    * @param configuration instance containing the user provided configuration values
-   * @param listeningAddress optional tuple of hostname and port to listen on. If None is given,
-   *                         then an Akka config for local actor system will be returned
+   * @param externalAddress optional tuple of bindAddress and port to be reachable at.
+   *                        If None is given, then an Akka config for local actor system
+   *                        will be returned
    * @return Akka config
    */
   @throws(classOf[UnknownHostException])
   def getAkkaConfig(configuration: Configuration,
-                    listeningAddress: Option[(String, Int)]): Config = {
+                    externalAddress: Option[(String, Int)]): Config = {
     val defaultConfig = getBasicAkkaConfig(configuration)
 
-    listeningAddress match {
+    externalAddress match {
 
       case Some((hostname, port)) =>
-        val ipAddress = InetAddress.getByName(hostname)
-        val hostString = "\"" + NetUtils.ipAddressToUrlString(ipAddress) + "\""
-        val remoteConfig = getRemoteAkkaConfig(configuration, hostString, port)
+
+        val remoteConfig = getRemoteAkkaConfig(configuration,
+          // the wildcard IP lets us bind to all network interfaces
+          NetUtils.getWildcardIPAddress, port,
+          hostname, port)
+
         remoteConfig.withFallback(defaultConfig)
 
       case None =>
@@ -141,13 +188,11 @@ object AkkaUtils {
    * @return Flink's basic Akka config
    */
   private def getBasicAkkaConfig(configuration: Configuration): Config = {
-    val akkaThroughput = configuration.getInteger(ConfigConstants.AKKA_DISPATCHER_THROUGHPUT,
-      ConfigConstants.DEFAULT_AKKA_DISPATCHER_THROUGHPUT)
-    val lifecycleEvents = configuration.getBoolean(ConfigConstants.AKKA_LOG_LIFECYCLE_EVENTS,
-      ConfigConstants.DEFAULT_AKKA_LOG_LIFECYCLE_EVENTS)
+    val akkaThroughput = configuration.getInteger(AkkaOptions.DISPATCHER_THROUGHPUT)
+    val lifecycleEvents = configuration.getBoolean(AkkaOptions.LOG_LIFECYCLE_EVENTS)
 
     val jvmExitOnFatalError = if (
-      configuration.getBoolean(ConfigConstants.AKKA_JVM_EXIT_ON_FATAL_ERROR, true)){
+      configuration.getBoolean(AkkaOptions.JVM_EXIT_ON_FATAL_ERROR)){
       "on"
     } else {
       "off"
@@ -157,10 +202,31 @@ object AkkaUtils {
 
     val logLevel = getLogLevel
 
+    val supervisorStrategy = classOf[StoppingSupervisorWithoutLoggingActorKilledExceptionStrategy]
+      .getCanonicalName
+
+    val forkJoinExecutorParallelismFactor =
+      configuration.getDouble(AkkaOptions.FORK_JOIN_EXECUTOR_PARALLELISM_FACTOR)
+
+    val forkJoinExecutorParallelismMin =
+      configuration.getInteger(AkkaOptions.FORK_JOIN_EXECUTOR_PARALLELISM_MIN)
+
+    val forkJoinExecutorParallelismMax =
+      configuration.getInteger(AkkaOptions.FORK_JOIN_EXECUTOR_PARALLELISM_MAX)
+
+    val forkJoinExecutorConfig =
+      s"""
+         | fork-join-executor {
+         |   parallelism-factor = $forkJoinExecutorParallelismFactor
+         |   parallelism-min = $forkJoinExecutorParallelismMin
+         |   parallelism-max = $forkJoinExecutorParallelismMax
+         | }
+       """.stripMargin
+
     val config =
       s"""
         |akka {
-        | daemonic = on
+        | daemonic = off
         |
         | loggers = ["akka.event.slf4j.Slf4jLogger"]
         | logging-filter = "akka.event.slf4j.Slf4jLoggingFilter"
@@ -177,13 +243,14 @@ object AkkaUtils {
         | log-dead-letters-during-shutdown = $logLifecycleEvents
         |
         | actor {
-        |   guardian-supervisor-strategy = "akka.actor.StoppingSupervisorStrategy"
+        |   guardian-supervisor-strategy = $supervisorStrategy
+        |
+        |   warn-about-java-serializer-usage = off
+        |
         |   default-dispatcher {
         |     throughput = $akkaThroughput
         |
-        |     fork-join-executor {
-        |       parallelism-factor = 2.0
-        |     }
+        |   $forkJoinExecutorConfig
         |   }
         | }
         |}
@@ -200,7 +267,7 @@ object AkkaUtils {
          |    default-dispatcher {
          |      fork-join-executor {
          |        parallelism-factor = 1.0
-         |        parallelism-min = 1
+         |        parallelism-min = 2
          |        parallelism-max = 4
          |      }
          |    }
@@ -211,97 +278,131 @@ object AkkaUtils {
     ConfigFactory.parseString(config)
   }
 
+  private def validateHeartbeat(pauseParamName: String,
+                                pauseValue: String,
+                                intervalParamName: String,
+                                intervalValue: String): Unit = {
+    if (Duration.apply(pauseValue).lteq(Duration.apply(intervalValue))) {
+      throw new IllegalConfigurationException(
+        "%s [%s] must greater then %s [%s]",
+        pauseParamName,
+        pauseValue,
+        intervalParamName,
+        intervalValue)
+    }
+  }
+
   /**
    * Creates a Akka config for a remote actor system listening on port on the network interface
-   * identified by hostname.
+   * identified by bindAddress.
    *
    * @param configuration instance containing the user provided configuration values
-   * @param hostname of the network interface to listen on
+   * @param bindAddress of the network interface to bind on
    * @param port to bind to or if 0 then Akka picks a free port automatically
+   * @param externalHostname The host name to expect for Akka messages
+   * @param externalPort The port to expect for Akka messages
    * @return Flink's Akka configuration for remote actor systems
    */
-  private def getRemoteAkkaConfig(configuration: Configuration,
-                                  hostname: String, port: Int): Config = {
-    val akkaAskTimeout = Duration(configuration.getString(
-      ConfigConstants.AKKA_ASK_TIMEOUT,
-      ConfigConstants.DEFAULT_AKKA_ASK_TIMEOUT))
+  private def getRemoteAkkaConfig(
+      configuration: Configuration,
+      bindAddress: String,
+      port: Int,
+      externalHostname: String,
+      externalPort: Int): Config = {
+
+    val normalizedExternalHostname = NetUtils.unresolvedHostToNormalizedString(externalHostname)
+
+    val akkaAskTimeout = Duration(configuration.getString(AkkaOptions.ASK_TIMEOUT))
 
     val startupTimeout = configuration.getString(
-      ConfigConstants.AKKA_STARTUP_TIMEOUT,
+      AkkaOptions.STARTUP_TIMEOUT,
       (akkaAskTimeout * 10).toString)
 
     val transportHeartbeatInterval = configuration.getString(
-      ConfigConstants.AKKA_TRANSPORT_HEARTBEAT_INTERVAL,
-      ConfigConstants.DEFAULT_AKKA_TRANSPORT_HEARTBEAT_INTERVAL)
+      AkkaOptions.TRANSPORT_HEARTBEAT_INTERVAL)
 
     val transportHeartbeatPause = configuration.getString(
-      ConfigConstants.AKKA_TRANSPORT_HEARTBEAT_PAUSE,
-      ConfigConstants.DEFAULT_AKKA_TRANSPORT_HEARTBEAT_PAUSE)
+      AkkaOptions.TRANSPORT_HEARTBEAT_PAUSE)
 
-    val transportThreshold = configuration.getDouble(
-      ConfigConstants.AKKA_TRANSPORT_THRESHOLD,
-      ConfigConstants.DEFAULT_AKKA_TRANSPORT_THRESHOLD)
+    validateHeartbeat(
+      AkkaOptions.TRANSPORT_HEARTBEAT_PAUSE.key(),
+      transportHeartbeatPause,
+      AkkaOptions.TRANSPORT_HEARTBEAT_INTERVAL.key(),
+      transportHeartbeatInterval)
+
+    val transportThreshold = configuration.getDouble(AkkaOptions.TRANSPORT_THRESHOLD)
 
     val watchHeartbeatInterval = configuration.getString(
-      ConfigConstants.AKKA_WATCH_HEARTBEAT_INTERVAL,
-      (akkaAskTimeout).toString)
+      AkkaOptions.WATCH_HEARTBEAT_INTERVAL)
 
-    val watchHeartbeatPause = configuration.getString(
-      ConfigConstants.AKKA_WATCH_HEARTBEAT_PAUSE,
-      (akkaAskTimeout * 10).toString)
+    val watchHeartbeatPause = configuration.getString(AkkaOptions.WATCH_HEARTBEAT_PAUSE)
 
-    val watchThreshold = configuration.getDouble(
-      ConfigConstants.AKKA_WATCH_THRESHOLD,
-      ConfigConstants.DEFAULT_AKKA_WATCH_THRESHOLD)
+    validateHeartbeat(
+      AkkaOptions.WATCH_HEARTBEAT_PAUSE.key(),
+      watchHeartbeatPause,
+      AkkaOptions.WATCH_HEARTBEAT_INTERVAL.key(),
+      watchHeartbeatInterval)
 
-    val akkaTCPTimeout = configuration.getString(
-      ConfigConstants.AKKA_TCP_TIMEOUT,
-      (akkaAskTimeout * 10).toString)
+    val watchThreshold = configuration.getInteger(AkkaOptions.WATCH_THRESHOLD)
 
-    val akkaFramesize = configuration.getString(
-      ConfigConstants.AKKA_FRAMESIZE,
-      ConfigConstants.DEFAULT_AKKA_FRAMESIZE)
+    val akkaTCPTimeout = configuration.getString(AkkaOptions.TCP_TIMEOUT)
 
-    val lifecycleEvents = configuration.getBoolean(
-      ConfigConstants.AKKA_LOG_LIFECYCLE_EVENTS,
-      ConfigConstants.DEFAULT_AKKA_LOG_LIFECYCLE_EVENTS)
+    val akkaFramesize = configuration.getString(AkkaOptions.FRAMESIZE)
+
+    val lifecycleEvents = configuration.getBoolean(AkkaOptions.LOG_LIFECYCLE_EVENTS)
 
     val logLifecycleEvents = if (lifecycleEvents) "on" else "off"
 
-    val akkaEnableSSLConfig = configuration.getBoolean(ConfigConstants.AKKA_SSL_ENABLED,
-        ConfigConstants.DEFAULT_AKKA_SSL_ENABLED) &&
-          SSLUtils.getSSLEnabled(configuration)
+    val akkaEnableSSLConfig = configuration.getBoolean(AkkaOptions.SSL_ENABLED) &&
+          SSLUtils.isInternalSSLEnabled(configuration)
+
+    val retryGateClosedFor = configuration.getLong(AkkaOptions.RETRY_GATE_CLOSED_FOR)
 
     val akkaEnableSSL = if (akkaEnableSSLConfig) "on" else "off"
 
     val akkaSSLKeyStore = configuration.getString(
-      ConfigConstants.SECURITY_SSL_KEYSTORE,
-      null)
+                              SecurityOptions.SSL_INTERNAL_KEYSTORE,
+                              configuration.getString(SecurityOptions.SSL_KEYSTORE))
 
     val akkaSSLKeyStorePassword = configuration.getString(
-      ConfigConstants.SECURITY_SSL_KEYSTORE_PASSWORD,
-      null)
+                              SecurityOptions.SSL_INTERNAL_KEYSTORE_PASSWORD,
+                              configuration.getString(SecurityOptions.SSL_KEYSTORE_PASSWORD))
 
     val akkaSSLKeyPassword = configuration.getString(
-      ConfigConstants.SECURITY_SSL_KEY_PASSWORD,
-      null)
+                              SecurityOptions.SSL_INTERNAL_KEY_PASSWORD,
+                              configuration.getString(SecurityOptions.SSL_KEY_PASSWORD))
 
     val akkaSSLTrustStore = configuration.getString(
-      ConfigConstants.SECURITY_SSL_TRUSTSTORE,
-      null)
+                              SecurityOptions.SSL_INTERNAL_TRUSTSTORE,
+                              configuration.getString(SecurityOptions.SSL_TRUSTSTORE))
 
     val akkaSSLTrustStorePassword = configuration.getString(
-      ConfigConstants.SECURITY_SSL_TRUSTSTORE_PASSWORD,
-      null)
+                              SecurityOptions.SSL_INTERNAL_TRUSTSTORE_PASSWORD,
+                              configuration.getString(SecurityOptions.SSL_TRUSTSTORE_PASSWORD))
 
-    val akkaSSLProtocol = configuration.getString(
-      ConfigConstants.SECURITY_SSL_PROTOCOL,
-      ConfigConstants.DEFAULT_SECURITY_SSL_PROTOCOL)
+    val akkaSSLProtocol = configuration.getString(SecurityOptions.SSL_PROTOCOL)
 
-    val akkaSSLAlgorithmsString = configuration.getString(
-      ConfigConstants.SECURITY_SSL_ALGORITHMS,
-      ConfigConstants.DEFAULT_SECURITY_SSL_ALGORITHMS)
+    val akkaSSLAlgorithmsString = configuration.getString(SecurityOptions.SSL_ALGORITHMS)
     val akkaSSLAlgorithms = akkaSSLAlgorithmsString.split(",").toList.mkString("[", ",", "]")
+
+    val clientSocketWorkerPoolPoolSizeMin =
+      configuration.getInteger(AkkaOptions.CLIENT_SOCKET_WORKER_POOL_SIZE_MIN)
+
+    val clientSocketWorkerPoolPoolSizeMax =
+      configuration.getInteger(AkkaOptions.CLIENT_SOCKET_WORKER_POOL_SIZE_MAX)
+
+    val clientSocketWorkerPoolPoolSizeFactor =
+      configuration.getDouble(AkkaOptions.CLIENT_SOCKET_WORKER_POOL_SIZE_FACTOR)
+
+    val serverSocketWorkerPoolPoolSizeMin =
+      configuration.getInteger(AkkaOptions.SERVER_SOCKET_WORKER_POOL_SIZE_MIN)
+
+    val serverSocketWorkerPoolPoolSizeMax =
+      configuration.getInteger(AkkaOptions.SERVER_SOCKET_WORKER_POOL_SIZE_MAX)
+
+    val serverSocketWorkerPoolPoolSizeFactor =
+      configuration.getDouble(AkkaOptions.SERVER_SOCKET_WORKER_POOL_SIZE_FACTOR)
+
 
     val configString =
       s"""
@@ -328,35 +429,55 @@ object AkkaUtils {
          |    netty {
          |      tcp {
          |        transport-class = "akka.remote.transport.netty.NettyTransport"
-         |        port = $port
+         |        port = $externalPort
+         |        bind-port = $port
          |        connection-timeout = $akkaTCPTimeout
          |        maximum-frame-size = $akkaFramesize
          |        tcp-nodelay = on
+         |
+         |        client-socket-worker-pool {
+         |          pool-size-min = $clientSocketWorkerPoolPoolSizeMin
+         |          pool-size-max = $clientSocketWorkerPoolPoolSizeMax
+         |          pool-size-factor = $clientSocketWorkerPoolPoolSizeFactor
+         |        }
+         |
+         |        server-socket-worker-pool {
+         |          pool-size-min = $serverSocketWorkerPoolPoolSizeMin
+         |          pool-size-max = $serverSocketWorkerPoolPoolSizeMax
+         |          pool-size-factor = $serverSocketWorkerPoolPoolSizeFactor
+         |        }
          |      }
          |    }
          |
          |    log-remote-lifecycle-events = $logLifecycleEvents
+         |
+         |    retry-gate-closed-for = ${retryGateClosedFor + " ms"}
          |  }
          |}
        """.stripMargin
 
-      val hostnameConfigString = if(hostname != null && hostname.nonEmpty){
-        s"""
-           |akka {
-           |  remote {
-           |    netty {
-           |      tcp {
-           |        hostname = $hostname
-           |      }
-           |    }
-           |  }
-           |}
-         """.stripMargin
-      }else{
-        // if hostname is null or empty, then leave hostname unspecified. Akka will pick
+    val effectiveHostname =
+      if (normalizedExternalHostname != null && normalizedExternalHostname.nonEmpty) {
+        normalizedExternalHostname
+      } else {
+        // if bindAddress is null or empty, then leave bindAddress unspecified. Akka will pick
         // InetAddress.getLocalHost.getHostAddress
-        ""
+        "\"\""
       }
+
+    val hostnameConfigString =
+      s"""
+         |akka {
+         |  remote {
+         |    netty {
+         |      tcp {
+         |        hostname = $effectiveHostname
+         |        bind-hostname = $bindAddress
+         |      }
+         |    }
+         |  }
+         |}
+       """.stripMargin
 
     val sslConfigString = if (akkaEnableSSLConfig) {
       s"""
@@ -381,6 +502,7 @@ object AkkaUtils {
          |          protocol = $akkaSSLProtocol
          |          enabled-algorithms = $akkaSSLAlgorithms
          |          random-number-generator = ""
+         |          require-mutual-authentication = on
          |        }
          |      }
          |    }
@@ -526,7 +648,7 @@ object AkkaUtils {
    * @param tries maximum number of tries before the future fails
    * @param executionContext which shall execute the future
    * @param timeout of the future
-   * @return future which tries to receover by re-executing itself a given number of times
+   * @return future which tries to recover by re-executing itself a given number of times
    */
   def retry(target: ActorRef, message: Any, tries: Int)(implicit executionContext:
   ExecutionContext, timeout: FiniteDuration): Future[Any] = {
@@ -541,14 +663,24 @@ object AkkaUtils {
   }
 
   def getTimeout(config: Configuration): FiniteDuration = {
-    val duration = Duration(config.getString(ConfigConstants.AKKA_ASK_TIMEOUT,
-      ConfigConstants.DEFAULT_AKKA_ASK_TIMEOUT))
+    val duration = Duration(config.getString(AkkaOptions.ASK_TIMEOUT))
 
     new FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
   }
 
+  def getTimeoutAsTime(config: Configuration): Time = {
+    try {
+      val duration = Duration(config.getString(AkkaOptions.ASK_TIMEOUT))
+
+      Time.milliseconds(duration.toMillis)
+    } catch {
+      case _: NumberFormatException =>
+        throw new IllegalConfigurationException(AkkaUtils.formatDurationParsingErrorMessage)
+    }
+  }
+
   def getDefaultTimeout: Time = {
-    val duration = Duration(ConfigConstants.DEFAULT_AKKA_ASK_TIMEOUT)
+    val duration = Duration(AkkaOptions.ASK_TIMEOUT.defaultValue())
 
     Time.milliseconds(duration.toMillis)
   }
@@ -560,30 +692,24 @@ object AkkaUtils {
   }
 
   def getLookupTimeout(config: Configuration): FiniteDuration = {
-    val duration = Duration(config.getString(
-      ConfigConstants.AKKA_LOOKUP_TIMEOUT,
-      ConfigConstants.DEFAULT_AKKA_LOOKUP_TIMEOUT))
+    val duration = Duration(config.getString(AkkaOptions.LOOKUP_TIMEOUT))
 
     new FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
   }
 
   def getDefaultLookupTimeout: FiniteDuration = {
-    val duration = Duration(ConfigConstants.DEFAULT_AKKA_LOOKUP_TIMEOUT)
+    val duration = Duration(AkkaOptions.LOOKUP_TIMEOUT.defaultValue())
     new FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
   }
 
   def getClientTimeout(config: Configuration): FiniteDuration = {
-    val duration = Duration(
-      config.getString(
-        ConfigConstants.AKKA_CLIENT_TIMEOUT,
-        ConfigConstants.DEFAULT_AKKA_CLIENT_TIMEOUT
-      ))
+    val duration = Duration(config.getString(AkkaOptions.CLIENT_TIMEOUT))
 
     new FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
   }
 
   def getDefaultClientTimeout: FiniteDuration = {
-    val duration = Duration(ConfigConstants.DEFAULT_AKKA_CLIENT_TIMEOUT)
+    val duration = Duration(AkkaOptions.CLIENT_TIMEOUT.defaultValue())
 
     new FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
   }
@@ -633,21 +759,15 @@ object AkkaUtils {
     * @return The InetSocketAddress with teh extracted host and port.
     */
   @throws(classOf[Exception])
-  def getInetSockeAddressFromAkkaURL(akkaURL: String): InetSocketAddress = {
+  def getInetSocketAddressFromAkkaURL(akkaURL: String): InetSocketAddress = {
     // AkkaURLs have the form schema://systemName@host:port/.... if it's a remote Akka URL
     try {
-      // we need to manually strip the protocol, because "akka.tcp" is not
-      // a valid protocol for Java's URL class
-      val protocolonPos = akkaURL.indexOf("://")
-      if (protocolonPos == -1 || protocolonPos >= akkaURL.length - 4) {
-        throw new MalformedURLException()
+      val address = getAddressFromAkkaURL(akkaURL)
+
+      (address.host, address.port) match {
+        case (Some(hostname), Some(portValue)) => new InetSocketAddress(hostname, portValue)
+        case _ => throw new MalformedURLException()
       }
-      
-      val url = new URL("http://" + akkaURL.substring(protocolonPos + 3))
-      if (url.getHost == null || url.getPort == -1) {
-        throw new MalformedURLException()
-      }
-      new InetSocketAddress(url.getHost, url.getPort)
     }
     catch {
       case _ : MalformedURLException =>
@@ -655,17 +775,82 @@ object AkkaUtils {
     }
   }
 
-  /** Returns the protocol field for the URL of the remote actor system given the user configuration
+  /**
+    * Extracts the [[Address]] from the given akka URL.
     *
-    * @param config instance containing the user provided configuration values
-    * @return the remote url's protocol field
+    * @param akkaURL to extract the [[Address]] from
+    * @throws java.net.MalformedURLException if the [[Address]] could not be parsed from
+    *                                        the given akka URL
+    * @return Extracted [[Address]] from the given akka URL
     */
-  def getAkkaProtocol(config: Configuration): String = {
-    val sslEnabled = config.getBoolean(ConfigConstants.AKKA_SSL_ENABLED,
-        ConfigConstants.DEFAULT_AKKA_SSL_ENABLED) &&
-      SSLUtils.getSSLEnabled(config)
-    if (sslEnabled) "akka.ssl.tcp" else "akka.tcp"
+  @throws(classOf[MalformedURLException])
+  def getAddressFromAkkaURL(akkaURL: String): Address = {
+    AddressFromURIString(akkaURL)
   }
 
+  def formatDurationParsingErrorMessage: String = {
+    "Duration format must be \"val unit\", where 'val' is a number and 'unit' is " +
+      "(d|day)|(h|hour)|(min|minute)|s|sec|second)|(ms|milli|millisecond)|" +
+      "(µs|micro|microsecond)|(ns|nano|nanosecond)"
+  }
+
+  /**
+    * Returns the local akka url for the given actor name.
+    *
+    * @param actorName Actor name identifying the actor
+    * @return Local Akka URL for the given actor
+    */
+  def getLocalAkkaURL(actorName: String): String = {
+    "akka://flink/user/" + actorName
+  }
+
+  /**
+    * Retries a function if it fails because of a [[java.net.BindException]].
+    *
+    * @param fn The function to retry
+    * @param stopCond Flag to signal termination
+    * @param maxSleepBetweenRetries Max random sleep time between retries
+    * @tparam T Return type of the function to retry
+    * @return Return value of the function to retry
+    */
+  @tailrec
+  def retryOnBindException[T](
+      fn: => T,
+      stopCond: => Boolean,
+      maxSleepBetweenRetries : Long = 0 )
+    : scala.util.Try[T] = {
+
+    def sleepBeforeRetry() : Unit = {
+      if (maxSleepBetweenRetries > 0) {
+        val sleepTime = (Math.random() * maxSleepBetweenRetries).asInstanceOf[Long]
+        LOG.info(s"Retrying after bind exception. Sleeping for $sleepTime ms.")
+        Thread.sleep(sleepTime)
+      }
+    }
+
+    scala.util.Try {
+      fn
+    } match {
+      case scala.util.Failure(x: BindException) =>
+        if (stopCond) {
+          scala.util.Failure(x)
+        } else {
+          sleepBeforeRetry()
+          retryOnBindException(fn, stopCond)
+        }
+      case scala.util.Failure(x: Exception) => x.getCause match {
+        case _: ChannelException =>
+          if (stopCond) {
+            scala.util.Failure(new RuntimeException(
+              "Unable to do further retries starting the actor system"))
+          } else {
+            sleepBeforeRetry()
+            retryOnBindException(fn, stopCond)
+          }
+        case _ => scala.util.Failure(x)
+      }
+      case f => f
+    }
+  }
 }
 

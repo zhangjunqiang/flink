@@ -15,19 +15,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.flink.storm.tests;
 
-import backtype.storm.Config;
-import backtype.storm.topology.TopologyBuilder;
+package org.apache.flink.storm.tests;
 
 import org.apache.flink.storm.api.FlinkLocalCluster;
 import org.apache.flink.storm.api.FlinkTopology;
 import org.apache.flink.storm.tests.operators.FiniteRandomSpout;
 import org.apache.flink.storm.tests.operators.MergerBolt;
 import org.apache.flink.storm.util.BoltFileSink;
-import org.apache.flink.streaming.util.StreamingProgramTestBase;
+import org.apache.flink.test.util.AbstractTestBase;
 
-public class StormUnionITCase extends StreamingProgramTestBase {
+import org.apache.storm.Config;
+import org.apache.storm.topology.TopologyBuilder;
+import org.junit.Test;
+
+/**
+ * Test for the {@link MergerBolt}.
+ */
+public class StormUnionITCase extends AbstractTestBase {
 
 	private static final String RESULT = "-1154715079\n" + "-1155869325\n" + "-1155484576\n"
 			+ "431529176\n" + "1260042744\n" + "1761283695\n" + "1749940626\n" + "892128508\n"
@@ -37,26 +42,17 @@ public class StormUnionITCase extends StreamingProgramTestBase {
 			+ "-624140595\n" + "-60658084\n" + "142959438\n" + "-613647601\n" + "-330177159\n"
 			+ "-54027108\n" + "1945002173\n" + "979930868";
 
-	private final static String topologyId = "Multiple Input Streams Test";
-	private final static String spoutId1 = "spout1";
-	private final static String spoutId2 = "spout2";
-	private final static String spoutId3 = "spout3";
-	private final static String boltId = "merger";
-	private final static String sinkId = "sink";
-	private String resultPath;
+	private static final String topologyId = "Multiple Input Streams Test";
+	private static final String spoutId1 = "spout1";
+	private static final String spoutId2 = "spout2";
+	private static final String spoutId3 = "spout3";
+	private static final String boltId = "merger";
+	private static final String sinkId = "sink";
 
-	@Override
-	protected void preSubmit() throws Exception {
-		this.resultPath = this.getTempDirPath("result");
-	}
+	@Test
+	public void testProgram() throws Exception {
+		String resultPath = this.getTempDirPath("result");
 
-	@Override
-	protected void postSubmit() throws Exception {
-		compareResultsByLinesInMemory(RESULT, this.resultPath);
-	}
-
-	@Override
-	protected void testProgram() throws Exception {
 		final TopologyBuilder builder = new TopologyBuilder();
 
 		// get input data
@@ -69,7 +65,7 @@ public class StormUnionITCase extends StreamingProgramTestBase {
 				.shuffleGrouping(spoutId2, FiniteRandomSpout.STREAM_PREFIX + 0)
 				.shuffleGrouping(spoutId3, FiniteRandomSpout.STREAM_PREFIX + 0);
 
-		final String[] tokens = this.resultPath.split(":");
+		final String[] tokens = resultPath.split(":");
 		final String outputFile = tokens[tokens.length - 1];
 		builder.setBolt(sinkId, new BoltFileSink(outputFile)).shuffleGrouping(boltId);
 
@@ -79,6 +75,8 @@ public class StormUnionITCase extends StreamingProgramTestBase {
 		conf.put(FlinkLocalCluster.SUBMIT_BLOCKING, true); // only required to stabilize integration test
 		cluster.submitTopology(topologyId, conf, FlinkTopology.createTopology(builder));
 		cluster.shutdown();
+
+		compareResultsByLinesInMemory(RESULT, resultPath);
 	}
 
 }

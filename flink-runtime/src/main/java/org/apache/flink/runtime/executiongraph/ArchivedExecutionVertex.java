@@ -26,6 +26,7 @@ import java.io.Serializable;
 public class ArchivedExecutionVertex implements AccessExecutionVertex, Serializable {
 
 	private static final long serialVersionUID = -6708241535015028576L;
+
 	private final int subTaskIndex;
 
 	private final EvictingBoundedList<ArchivedExecution> priorExecutions;
@@ -35,15 +36,22 @@ public class ArchivedExecutionVertex implements AccessExecutionVertex, Serializa
 
 	private final ArchivedExecution currentExecution;    // this field must never be null
 
+	// ------------------------------------------------------------------------
+
 	public ArchivedExecutionVertex(ExecutionVertex vertex) {
 		this.subTaskIndex = vertex.getParallelSubtaskIndex();
-		EvictingBoundedList<Execution> copyOfPriorExecutionsList = vertex.getCopyOfPriorExecutionsList();
-		priorExecutions = new EvictingBoundedList<>(copyOfPriorExecutionsList.getSizeLimit());
-		for (Execution priorExecution : copyOfPriorExecutionsList) {
-			priorExecutions.add(priorExecution != null ? priorExecution.archive() : null);
-		}
+		this.priorExecutions = vertex.getCopyOfPriorExecutionsList();
 		this.taskNameWithSubtask = vertex.getTaskNameWithSubtaskIndex();
 		this.currentExecution = vertex.getCurrentExecutionAttempt().archive();
+	}
+
+	public ArchivedExecutionVertex(
+			int subTaskIndex, String taskNameWithSubtask,
+			ArchivedExecution currentExecution, EvictingBoundedList<ArchivedExecution> priorExecutions) {
+		this.subTaskIndex = subTaskIndex;
+		this.taskNameWithSubtask = taskNameWithSubtask;
+		this.currentExecution = currentExecution;
+		this.priorExecutions = priorExecutions;
 	}
 
 	// --------------------------------------------------------------------------------------------

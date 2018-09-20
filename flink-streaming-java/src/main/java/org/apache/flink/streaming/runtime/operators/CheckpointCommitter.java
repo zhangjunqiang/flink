@@ -15,6 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.streaming.runtime.operators;
 
 import org.slf4j.Logger;
@@ -40,6 +41,7 @@ import java.io.Serializable;
  * and as such should kept as small as possible.
  */
 public abstract class CheckpointCommitter implements Serializable {
+
 	protected static final Logger LOG = LoggerFactory.getLogger(CheckpointCommitter.class);
 
 	protected String jobId;

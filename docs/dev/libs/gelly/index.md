@@ -33,6 +33,7 @@ Gelly is a Graph API for Flink. It contains a set of methods and utilities which
 * [Library Methods](library_methods.html)
 * [Graph Algorithms](graph_algorithms.html)
 * [Graph Generators](graph_generators.html)
+* [Bipartite Graphs](bipartite_graph.html)
 
 Using Gelly
 -----------
@@ -62,41 +63,48 @@ Add the following dependency to your `pom.xml` to use Gelly.
 </div>
 </div>
 
-Note that Gelly is currently not part of the binary distribution. See linking with it for cluster execution [here]({{ site.baseurl }}/dev/cluster_execution.html#linking-with-modules-not-contained-in-the-binary-distribution).
+Note that Gelly is not part of the binary distribution. See [linking]({{ site.baseurl }}/dev/linking.html) for
+instructions on packaging Gelly libraries into Flink user programs.
 
 The remaining sections provide a description of available methods and present several examples of how to use Gelly and how to mix it with the Flink DataSet API.
 
 Running Gelly Examples
 ----------------------
 
-The Gelly library and examples jars are provided in the [Flink distribution](https://flink.apache.org/downloads.html "Apache Flink: Downloads")
-in the folder **opt/lib/gelly** (for versions older than Flink 1.2 these can be manually downloaded from
-[Maven Central](http://search.maven.org/#search|ga|1|flink%20gelly).
+The Gelly library jars are provided in the [Flink distribution](https://flink.apache.org/downloads.html "Apache Flink: Downloads")
+in the **opt** directory (for versions older than Flink 1.2 these can be manually downloaded from
+[Maven Central](http://search.maven.org/#search|ga|1|flink%20gelly)). To run the Gelly examples the **flink-gelly** (for
+Java) or **flink-gelly-scala** (for Scala) jar must be copied to Flink's **lib** directory.
 
-To run the Gelly examples the **flink-gelly** (for Java) or **flink-gelly-scala** (for Scala) jar must be copied to
-Flink's **lib** directory.
+{% highlight bash %}
+cp opt/flink-gelly_*.jar lib/
+cp opt/flink-gelly-scala_*.jar lib/
+{% endhighlight %}
 
-~~~bash
-cp opt/lib/gelly/flink-gelly_*.jar lib/
-cp opt/lib/gelly/flink-gelly-scala_*.jar lib/
-~~~
+Gelly's examples jar includes drivers for each of the library methods and is provided in the **examples** directory.
+After configuring and starting the cluster, list the available algorithm classes:
 
-Gelly's examples jar includes both drivers for the library methods as well as additional example algorithms. After
-configuring and starting the cluster, list the available algorithm classes:
-
-~~~bash
+{% highlight bash %}
 ./bin/start-cluster.sh
-./bin/flink run opt/lib/gelly/flink-gelly-examples_*.jar
-~~~
+./bin/flink run examples/gelly/flink-gelly-examples_*.jar
+{% endhighlight %}
 
-The Gelly drivers can generate [RMat](http://www.cs.cmu.edu/~christos/PUBLICATIONS/siam04.pdf) graph data or read the
-edge list from a CSV file. Each node in a cluster must have access to the input file. Calculate graph metrics on a
-directed generated graph:
+The Gelly drivers can generate graph data or read the edge list from a CSV file (each node in a cluster must have access
+to the input file). The algorithm description, available inputs and outputs, and configuration are displayed when an
+algorithm is selected. Print usage for [JaccardIndex](./library_methods.html#jaccard-index):
 
-~~~bash
-./bin/flink run -c org.apache.flink.graph.drivers.GraphMetrics opt/lib/gelly/flink-gelly-examples_*.jar \
-    --directed true --input rmat
-~~~
+{% highlight bash %}
+./bin/flink run examples/gelly/flink-gelly-examples_*.jar --algorithm JaccardIndex
+{% endhighlight %}
+
+Display [graph metrics](./library_methods.html#metric) for a million vertex graph:
+
+{% highlight bash %}
+./bin/flink run examples/gelly/flink-gelly-examples_*.jar \
+    --algorithm GraphMetrics --order directed \
+    --input RMatGraph --type integer --scale 20 --simplify directed \
+    --output print
+{% endhighlight %}
 
 The size of the graph is adjusted by the *\-\-scale* and *\-\-edge_factor* parameters. The
 [library generator](./graph_generators.html#rmat-graph) provides access to additional configuration to adjust the
@@ -106,20 +114,24 @@ Sample social network data is provided by the [Stanford Network Analysis Project
 The [com-lj](http://snap.stanford.edu/data/bigdata/communities/com-lj.ungraph.txt.gz) data set is a good starter size.
 Run a few algorithms and monitor the job progress in Flink's Web UI:
 
-~~~bash
+{% highlight bash %}
 wget -O - http://snap.stanford.edu/data/bigdata/communities/com-lj.ungraph.txt.gz | gunzip -c > com-lj.ungraph.txt
 
-./bin/flink run -q -c org.apache.flink.graph.drivers.GraphMetrics opt/lib/gelly/flink-gelly-examples_*.jar \
-    --directed true --input csv --type integer --input_filename com-lj.ungraph.txt --input_field_delimiter '\t'
+./bin/flink run -q examples/gelly/flink-gelly-examples_*.jar \
+    --algorithm GraphMetrics --order undirected \
+    --input CSV --type integer --simplify undirected --input_filename com-lj.ungraph.txt --input_field_delimiter $'\t' \
+    --output print
 
-./bin/flink run -q -c org.apache.flink.graph.drivers.ClusteringCoefficient opt/lib/gelly/flink-gelly-examples_*.jar \
-    --directed true --input csv --type integer --input_filename com-lj.ungraph.txt  --input_field_delimiter '\t' \
+./bin/flink run -q examples/gelly/flink-gelly-examples_*.jar \
+    --algorithm ClusteringCoefficient --order undirected \
+    --input CSV --type integer --simplify undirected --input_filename com-lj.ungraph.txt --input_field_delimiter $'\t' \
     --output hash
 
-./bin/flink run -q -c org.apache.flink.graph.drivers.JaccardIndex opt/lib/gelly/flink-gelly-examples_*.jar \
-    --input csv --type integer --simplify true --input_filename com-lj.ungraph.txt --input_field_delimiter '\t' \
+./bin/flink run -q examples/gelly/flink-gelly-examples_*.jar \
+    --algorithm JaccardIndex \
+    --input CSV --type integer --simplify undirected --input_filename com-lj.ungraph.txt --input_field_delimiter $'\t' \
     --output hash
-~~~
+{% endhighlight %}
 
 Please submit feature requests and report issues on the user [mailing list](https://flink.apache.org/community.html#mailing-lists)
 or [Flink Jira](https://issues.apache.org/jira/browse/FLINK). We welcome suggestions for new algorithms and features as

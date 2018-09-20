@@ -18,12 +18,14 @@
 
 package org.apache.flink.streaming.api.windowing.triggers;
 
-import org.apache.flink.streaming.api.windowing.windows.Window;
-
 /**
  * Result type for trigger methods. This determines what happens with the window,
  * for example whether the window function should be called, or the window
  * should be discarded.
+ *
+ * <p>If a {@link Trigger} returns {@link #FIRE} or {@link #FIRE_AND_PURGE} but the window does not
+ * contain any data the window function will not be invoked, i.e. no data will be produced for the
+ * window.
  */
 public enum TriggerResult {
 
@@ -34,7 +36,7 @@ public enum TriggerResult {
 
 	/**
 	 * {@code FIRE_AND_PURGE} evaluates the window function and emits the window
-	 * result. 
+	 * result.
 	 */
 	FIRE_AND_PURGE(true, true),
 
@@ -51,7 +53,7 @@ public enum TriggerResult {
 	PURGE(false, true);
 
 	// ------------------------------------------------------------------------
-	
+
 	private final boolean fire;
 	private final boolean purge;
 
@@ -66,31 +68,5 @@ public enum TriggerResult {
 
 	public boolean isPurge() {
 		return purge;
-	}
-
-	// ------------------------------------------------------------------------
-	
-	/**
-	 * Merges two {@code TriggerResults}. This specifies what should happen if we have
-	 * two results from a Trigger, for example as a result from
-	 * {@link Trigger#onElement(Object, long, Window, Trigger.TriggerContext)} and
-	 * {@link Trigger#onEventTime(long, Window, Trigger.TriggerContext)}.
-	 *
-	 * <p>
-	 * For example, if one result says {@code CONTINUE} while the other says {@code FIRE}
-	 * then {@code FIRE} is the combined result;
-	 */
-	public static TriggerResult merge(TriggerResult a, TriggerResult b) {
-		if (a.purge || b.purge) {
-			if (a.fire || b.fire) {
-				return FIRE_AND_PURGE;
-			} else {
-				return PURGE;
-			}
-		} else if (a.fire || b.fire) {
-			return FIRE;
-		} else {
-			return CONTINUE;
-		}
 	}
 }

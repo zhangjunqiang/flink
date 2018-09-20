@@ -19,12 +19,14 @@
 package org.apache.flink.mesos.runtime.clusterframework
 
 import org.apache.flink.runtime.clusterframework.types.ResourceID
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices
 import org.apache.flink.runtime.io.disk.iomanager.IOManager
 import org.apache.flink.runtime.io.network.NetworkEnvironment
-import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService
 import org.apache.flink.runtime.memory.MemoryManager
-import org.apache.flink.runtime.metrics.MetricRegistry
-import org.apache.flink.runtime.taskmanager.{TaskManager, TaskManagerConfiguration, TaskManagerLocation}
+import org.apache.flink.runtime.metrics.groups.TaskManagerMetricGroup
+import org.apache.flink.runtime.state.TaskExecutorLocalStateStoresManager
+import org.apache.flink.runtime.taskexecutor.TaskManagerConfiguration
+import org.apache.flink.runtime.taskmanager.{TaskManager, TaskManagerLocation}
 
 /** An extension of the TaskManager that listens for additional Mesos-related
   * messages.
@@ -36,9 +38,10 @@ class MesosTaskManager(
     memoryManager: MemoryManager,
     ioManager: IOManager,
     network: NetworkEnvironment,
+    taskManagerLocalStateStoresManager: TaskExecutorLocalStateStoresManager,
     numberOfSlots: Int,
-    leaderRetrievalService: LeaderRetrievalService,
-    metricRegistry : MetricRegistry)
+    highAvailabilityServices: HighAvailabilityServices,
+    taskManagerMetricGroup : TaskManagerMetricGroup)
   extends TaskManager(
     config,
     resourceID,
@@ -46,9 +49,10 @@ class MesosTaskManager(
     memoryManager,
     ioManager,
     network,
+    taskManagerLocalStateStoresManager,
     numberOfSlots,
-    leaderRetrievalService,
-    metricRegistry) {
+    highAvailabilityServices,
+    taskManagerMetricGroup) {
 
   override def handleMessage: Receive = {
     super.handleMessage

@@ -20,8 +20,8 @@ package org.apache.flink.api.common;
 
 import org.apache.flink.annotation.Internal;
 
-import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * Encapsulates task-specific information: name, index of subtask, parallelism and attempt number.
@@ -31,24 +31,48 @@ public class TaskInfo {
 
 	private final String taskName;
 	private final String taskNameWithSubtasks;
-	private final int numberOfKeyGroups;
+	private final String allocationIDAsString;
+	private final int maxNumberOfParallelSubtasks;
 	private final int indexOfSubtask;
 	private final int numberOfParallelSubtasks;
 	private final int attemptNumber;
 
-	public TaskInfo(String taskName, int numberOfKeyGroups, int indexOfSubtask, int numberOfParallelSubtasks, int attemptNumber) {
+	public TaskInfo(
+		String taskName,
+		int maxNumberOfParallelSubtasks,
+		int indexOfSubtask,
+		int numberOfParallelSubtasks,
+		int attemptNumber) {
+		this(
+			taskName,
+			maxNumberOfParallelSubtasks,
+			indexOfSubtask,
+			numberOfParallelSubtasks,
+			attemptNumber,
+			"UNKNOWN");
+	}
+
+	public TaskInfo(
+		String taskName,
+		int maxNumberOfParallelSubtasks,
+		int indexOfSubtask,
+		int numberOfParallelSubtasks,
+		int attemptNumber,
+		String allocationIDAsString) {
+
 		checkArgument(indexOfSubtask >= 0, "Task index must be a non-negative number.");
-		checkArgument(numberOfKeyGroups >= 1, "Max parallelism must be a positive number.");
-		checkArgument(numberOfKeyGroups >= numberOfParallelSubtasks, "Max parallelism must be >= than parallelism.");
+		checkArgument(maxNumberOfParallelSubtasks >= 1, "Max parallelism must be a positive number.");
+		checkArgument(maxNumberOfParallelSubtasks >= numberOfParallelSubtasks, "Max parallelism must be >= than parallelism.");
 		checkArgument(numberOfParallelSubtasks >= 1, "Parallelism must be a positive number.");
 		checkArgument(indexOfSubtask < numberOfParallelSubtasks, "Task index must be less than parallelism.");
 		checkArgument(attemptNumber >= 0, "Attempt number must be a non-negative number.");
 		this.taskName = checkNotNull(taskName, "Task Name must not be null.");
-		this.numberOfKeyGroups = numberOfKeyGroups;
+		this.maxNumberOfParallelSubtasks = maxNumberOfParallelSubtasks;
 		this.indexOfSubtask = indexOfSubtask;
 		this.numberOfParallelSubtasks = numberOfParallelSubtasks;
 		this.attemptNumber = attemptNumber;
 		this.taskNameWithSubtasks = taskName + " (" + (indexOfSubtask + 1) + '/' + numberOfParallelSubtasks + ')';
+		this.allocationIDAsString = checkNotNull(allocationIDAsString);
 	}
 
 	/**
@@ -61,10 +85,10 @@ public class TaskInfo {
 	}
 
 	/**
-	 * Gets the number of key groups aka the max parallelism aka the max number of subtasks.
+	 * Gets the max parallelism aka the max number of subtasks.
 	 */
-	public int getNumberOfKeyGroups() {
-		return numberOfKeyGroups;
+	public int getMaxNumberOfParallelSubtasks() {
+		return maxNumberOfParallelSubtasks;
 	}
 
 	/**
@@ -106,5 +130,13 @@ public class TaskInfo {
 	 */
 	public String getTaskNameWithSubtasks() {
 		return this.taskNameWithSubtasks;
+	}
+
+	/**
+	 * Returns the allocation id for where this task is executed.
+	 * @return the allocation id for where this task is executed.
+	 */
+	public String getAllocationIDAsString() {
+		return allocationIDAsString;
 	}
 }

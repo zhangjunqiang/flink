@@ -21,23 +21,22 @@ package org.apache.flink.streaming.api.graph;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.functions.KeySelector;
-import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.streaming.api.datastream.ConnectedStreams;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
 import org.apache.flink.streaming.api.functions.co.CoMapFunction;
+import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.api.operators.OutputTypeConfigurable;
+import org.apache.flink.streaming.api.operators.StreamSource;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.partitioner.BroadcastPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.GlobalPartitioner;
-import org.apache.flink.streaming.runtime.partitioner.KeyGroupStreamPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.RebalancePartitioner;
 import org.apache.flink.streaming.runtime.partitioner.ShufflePartitioner;
 import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
@@ -57,13 +56,56 @@ import static org.junit.Assert.assertTrue;
  * union, partitioning since the other translation routines are tested already in operation
  * specific tests.
  */
+@SuppressWarnings("serial")
 public class StreamGraphGeneratorTest {
+
+	@Test
+	public void testBufferTimeout() {
+		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+		env.setBufferTimeout(77); // set timeout to some recognizable number
+
+		env
+			.fromElements(1, 2, 3, 4, 5)
+
+			.map(value -> value)
+				.setBufferTimeout(-1)
+				.name("A")
+			.map(value -> value)
+				.setBufferTimeout(0)
+				.name("B")
+			.map(value -> value)
+				.setBufferTimeout(12)
+				.name("C")
+			.map(value -> value)
+				.name("D");
+
+		final StreamGraph sg = env.getStreamGraph();
+		for (StreamNode node : sg.getStreamNodes()) {
+			switch (node.getOperatorName()) {
+
+				case "A":
+					assertEquals(77L, node.getBufferTimeout().longValue());
+					break;
+				case "B":
+					assertEquals(0L, node.getBufferTimeout().longValue());
+					break;
+				case "C":
+					assertEquals(12L, node.getBufferTimeout().longValue());
+					break;
+				case "D":
+					assertEquals(77L, node.getBufferTimeout().longValue());
+					break;
+				default:
+					assertTrue(node.getOperator() instanceof StreamSource);
+			}
+		}
+	}
 
 	/**
 	 * This tests whether virtual Transformations behave correctly.
 	 *
-	 * <p>
-	 * Verifies that partitioning, output selector, selected names are correctly set in the
+	 * <p>Verifies that partitioning, output selector, selected names are correctly set in the
 	 * StreamGraph when they are intermixed.
 	 */
 	@Test
@@ -82,7 +124,7 @@ public class StreamGraphGeneratorTest {
 				.broadcast()
 				.map(new NoOpIntMap());
 
-		broadcastMap.addSink(new DiscardingSink<Integer>());
+		broadcastMap.addSink(new DiscardingSink<>());
 
 		// verify that partitioning is preserved across union and split/select
 		EvenOddOutputSelector selector1 = new EvenOddOutputSelector();
@@ -114,11 +156,10 @@ public class StreamGraphGeneratorTest {
 				.select("even")
 				.shuffle();
 
-
 		SingleOutputStreamOperator<Integer> unionedMap = map1.union(map2).union(map3)
 				.map(new NoOpIntMap());
 
-		unionedMap.addSink(new DiscardingSink<Integer>());
+		unionedMap.addSink(new DiscardingSink<>());
 
 		StreamGraph graph = env.getStreamGraph();
 
@@ -146,7 +187,7 @@ public class StreamGraphGeneratorTest {
 	/**
 	 * This tests whether virtual Transformations behave correctly.
 	 *
-	 * Checks whether output selector, partitioning works correctly when applied on a union.
+	 * <p>Checks whether output selector, partitioning works correctly when applied on a union.
 	 */
 	@Test
 	public void testVirtualTransformations2() throws Exception {
@@ -174,7 +215,7 @@ public class StreamGraphGeneratorTest {
 				.select("foo")
 				.map(new NoOpIntMap());
 
-		unionedMap.addSink(new DiscardingSink<Integer>());
+		unionedMap.addSink(new DiscardingSink<>());
 
 		StreamGraph graph = env.getStreamGraph();
 
@@ -196,8 +237,6 @@ public class StreamGraphGeneratorTest {
 	/**
 	 * Test whether an {@link OutputTypeConfigurable} implementation gets called with the correct
 	 * output type. In this test case the output type must be BasicTypeInfo.INT_TYPE_INFO.
-	 *
-	 * @throws Exception
 	 */
 	@Test
 	public void testOutputTypeConfigurationWithOneInputTransformation() throws Exception {
@@ -212,7 +251,7 @@ public class StreamGraphGeneratorTest {
 			BasicTypeInfo.INT_TYPE_INFO,
 			outputTypeConfigurableOperation);
 
-		result.addSink(new DiscardingSink<Integer>());
+		result.addSink(new DiscardingSink<>());
 
 		env.getStreamGraph();
 
@@ -235,7 +274,7 @@ public class StreamGraphGeneratorTest {
 				BasicTypeInfo.INT_TYPE_INFO,
 				outputTypeConfigurableOperation);
 
-		result.addSink(new DiscardingSink<Integer>());
+		result.addSink(new DiscardingSink<>());
 
 		env.getStreamGraph();
 
@@ -254,16 +293,9 @@ public class StreamGraphGeneratorTest {
 
 		DataStream<Integer> source = env.fromElements(1, 2, 3);
 
-		DataStream<Integer> keyedResult = source.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 9205556348021992189L;
+		DataStream<Integer> keyedResult = source.keyBy(value -> value).map(new NoOpIntMap());
 
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap());
-
-		keyedResult.addSink(new DiscardingSink<Integer>());
+		keyedResult.addSink(new DiscardingSink<>());
 
 		StreamGraph graph = env.getStreamGraph();
 
@@ -273,7 +305,7 @@ public class StreamGraphGeneratorTest {
 	}
 
 	/**
-	 * Tests that the global and operator-wide max parallelism setting is respected
+	 * Tests that the global and operator-wide max parallelism setting is respected.
 	 */
 	@Test
 	public void testMaxParallelismForwarding() {
@@ -285,25 +317,14 @@ public class StreamGraphGeneratorTest {
 
 		DataStream<Integer> source = env.fromElements(1, 2, 3);
 
-		DataStream<Integer> keyedResult1 = source.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 9205556348021992189L;
+		DataStream<Integer> keyedResult1 = source.keyBy(value -> value).map(new NoOpIntMap());
 
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap());
+		DataStream<Integer> keyedResult2 = keyedResult1
+				.keyBy(value -> value)
+				.map(new NoOpIntMap())
+					.setMaxParallelism(keyedResult2MaxParallelism);
 
-		DataStream<Integer> keyedResult2 = keyedResult1.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 1250168178707154838L;
-
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap()).setMaxParallelism(keyedResult2MaxParallelism);
-
-		keyedResult2.addSink(new DiscardingSink<Integer>());
+		keyedResult2.addSink(new DiscardingSink<>());
 
 		StreamGraph graph = env.getStreamGraph();
 
@@ -328,53 +349,21 @@ public class StreamGraphGeneratorTest {
 
 		DataStream<Integer> source = env.fromElements(1, 2, 3);
 
-		DataStream<Integer> keyedResult1 = source.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 9205556348021992189L;
+		DataStream<Integer> keyedResult1 = source.keyBy(value -> value).map(new NoOpIntMap());
 
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap());
+		DataStream<Integer> keyedResult2 = keyedResult1.keyBy(value -> value).map(new NoOpIntMap()).setParallelism(mapParallelism);
 
-		DataStream<Integer> keyedResult2 = keyedResult1.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 1250168178707154838L;
+		DataStream<Integer> keyedResult3 = keyedResult2.keyBy(value -> value).map(new NoOpIntMap()).setMaxParallelism(maxParallelism);
 
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap()).setParallelism(mapParallelism);
+		DataStream<Integer> keyedResult4 = keyedResult3.keyBy(value -> value).map(new NoOpIntMap()).setMaxParallelism(maxParallelism).setParallelism(mapParallelism);
 
-		DataStream<Integer> keyedResult3 = keyedResult2.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 1250168178707154838L;
-
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap()).setMaxParallelism(maxParallelism);
-
-		DataStream<Integer> keyedResult4 = keyedResult3.keyBy(new KeySelector<Integer, Integer>() {
-			private static final long serialVersionUID = 1250168178707154838L;
-
-			@Override
-			public Integer getKey(Integer value) throws Exception {
-				return value;
-			}
-		}).map(new NoOpIntMap()).setMaxParallelism(maxParallelism).setParallelism(mapParallelism);
-
-		keyedResult4.addSink(new DiscardingSink<Integer>());
+		keyedResult4.addSink(new DiscardingSink<>());
 
 		StreamGraph graph = env.getStreamGraph();
 
-		StreamNode keyedResult1Node = graph.getStreamNode(keyedResult1.getId());
-		StreamNode keyedResult2Node = graph.getStreamNode(keyedResult2.getId());
 		StreamNode keyedResult3Node = graph.getStreamNode(keyedResult3.getId());
 		StreamNode keyedResult4Node = graph.getStreamNode(keyedResult4.getId());
 
-		assertEquals(KeyGroupRangeAssignment.DEFAULT_MAX_PARALLELISM, keyedResult1Node.getMaxParallelism());
-		assertEquals(KeyGroupRangeAssignment.DEFAULT_MAX_PARALLELISM, keyedResult2Node.getMaxParallelism());
 		assertEquals(maxParallelism, keyedResult3Node.getMaxParallelism());
 		assertEquals(maxParallelism, keyedResult4Node.getMaxParallelism());
 	}
@@ -393,25 +382,12 @@ public class StreamGraphGeneratorTest {
 
 		env.getConfig().setMaxParallelism(maxParallelism);
 
-		DataStream<Integer> keyedResult = input1.connect(input2).keyBy(
-			 new KeySelector<Integer, Integer>() {
-				 private static final long serialVersionUID = -6908614081449363419L;
+		DataStream<Integer> keyedResult = input1
+				.connect(input2)
+				.keyBy(value -> value, value -> value)
+				.map(new NoOpIntCoMap());
 
-				 @Override
-				 public Integer getKey(Integer value) throws Exception {
-					 return value;
-				 }
-			},
-			new KeySelector<Integer, Integer>() {
-				private static final long serialVersionUID = 3195683453223164931L;
-
-				@Override
-				public Integer getKey(Integer value) throws Exception {
-					return value;
-				}
-			}).map(new NoOpIntCoMap());
-
-		keyedResult.addSink(new DiscardingSink<Integer>());
+		keyedResult.addSink(new DiscardingSink<>());
 
 		StreamGraph graph = env.getStreamGraph();
 
@@ -419,6 +395,29 @@ public class StreamGraphGeneratorTest {
 
 		StreamPartitioner<?> streamPartitioner1 = keyedResultNode.getInEdges().get(0).getPartitioner();
 		StreamPartitioner<?> streamPartitioner2 = keyedResultNode.getInEdges().get(1).getPartitioner();
+	}
+
+	/**
+	 * Tests that the json generated by JSONGenerator shall meet with 2 requirements:
+	 * 1. sink nodes are at the back
+	 * 2. if both two nodes are sink nodes or neither of them is sink node, then sort by its id.
+	 */
+	@Test
+	public void testSinkIdComparison() {
+		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+		DataStream<Integer> source = env.fromElements(1, 2, 3);
+		for (int i = 0; i < 32; i++) {
+			if (i % 2 == 0) {
+				source.addSink(new SinkFunction<Integer>() {
+					@Override
+					public void invoke(Integer value, Context ctx) throws Exception {}
+				});
+			} else {
+				source.map(x -> x + 1);
+			}
+		}
+		// IllegalArgumentException will be thrown without FLINK-9216
+		env.getStreamGraph().getStreamingPlanAsJSON();
 	}
 
 	private static class OutputTypeConfigurableOperationWithTwoInputs
@@ -508,6 +507,5 @@ public class StreamGraphGeneratorTest {
 			return value;
 		}
 
-	};
-
+	}
 }

@@ -20,6 +20,9 @@ package org.apache.flink.graph.generator;
 
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.operators.base.ReduceOperatorBase.CombineHint;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.functions.FunctionAnnotation.ForwardedFields;
@@ -31,8 +34,16 @@ import org.apache.flink.types.LongValue;
 import org.apache.flink.types.NullValue;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.LongValueSequenceIterator;
+import org.apache.flink.util.Preconditions;
 
+import java.util.Collections;
+
+/**
+ * Utilities for graph generators.
+ */
 public class GraphGeneratorUtils {
+
+	private GraphGeneratorUtils() {}
 
 	/**
 	 * Generates {@link Vertex Vertices} with sequential, numerical labels.
@@ -40,27 +51,35 @@ public class GraphGeneratorUtils {
 	 * @param env the Flink execution environment.
 	 * @param parallelism operator parallelism
 	 * @param vertexCount number of sequential vertex labels
-	 * @return {@link DataSet} of sequentially labeled {@link Vertex Vertices}
+	 * @return {@link DataSet} of sequentially labeled {@link Vertex vertices}
 	 */
-	public static DataSet<Vertex<LongValue,NullValue>> vertexSequence(ExecutionEnvironment env, int parallelism, long vertexCount) {
-		LongValueSequenceIterator iterator = new LongValueSequenceIterator(0, vertexCount-1);
+	public static DataSet<Vertex<LongValue, NullValue>> vertexSequence(ExecutionEnvironment env, int parallelism, long vertexCount) {
+		Preconditions.checkArgument(vertexCount >= 0, "Vertex count must be non-negative");
 
-		DataSource<LongValue> vertexLabels = env
-			.fromParallelCollection(iterator, LongValue.class)
-				.setParallelism(parallelism)
-				.name("Vertex iterators");
+		if (vertexCount == 0) {
+			return env
+				.fromCollection(Collections.emptyList(), TypeInformation.of(new TypeHint<Vertex<LongValue, NullValue>>(){}))
+					.setParallelism(parallelism)
+					.name("Empty vertex set");
+		} else {
+			LongValueSequenceIterator iterator = new LongValueSequenceIterator(0, vertexCount - 1);
 
-		return vertexLabels
-			.map(new CreateVertex())
-				.setParallelism(parallelism)
-				.name("Vertex sequence");
+			DataSource<LongValue> vertexLabels = env
+				.fromParallelCollection(iterator, LongValue.class)
+					.setParallelism(parallelism)
+					.name("Vertex indices");
+
+			return vertexLabels
+				.map(new CreateVertex())
+					.setParallelism(parallelism)
+					.name("Vertex sequence");
+		}
 	}
 
 	@ForwardedFields("*->f0")
 	private static class CreateVertex
-	implements MapFunction<LongValue, Vertex<LongValue,NullValue>> {
-
-		private Vertex<LongValue,NullValue> vertex = new Vertex<>(null, NullValue.getInstance());
+	implements MapFunction<LongValue, Vertex<LongValue, NullValue>> {
+		private Vertex<LongValue, NullValue> vertex = new Vertex<>(null, NullValue.getInstance());
 
 		@Override
 		public Vertex<LongValue, NullValue> map(LongValue value)
@@ -74,24 +93,25 @@ public class GraphGeneratorUtils {
 	// --------------------------------------------------------------------------------------------
 
 	/**
-	 * Generates {@link Vertex Vertices} present in the given set of {@link Edge}s.
+	 * Generates {@link Vertex vertices} present in the given set of {@link Edge}s.
 	 *
 	 * @param edges source {@link DataSet} of {@link Edge}s
 	 * @param parallelism operator parallelism
 	 * @param <K> label type
 	 * @param <EV> edge value type
-	 * @return {@link DataSet} of discovered {@link Vertex Vertices}
+	 * @return {@link DataSet} of discovered {@link Vertex vertices}
 	 *
 	 * @see Graph#fromDataSet(DataSet, DataSet, ExecutionEnvironment)
 	 */
-	public static <K,EV> DataSet<Vertex<K,NullValue>> vertexSet(DataSet<Edge<K,EV>> edges, int parallelism) {
-		DataSet<Vertex<K,NullValue>> vertexSet = edges
-			.flatMap(new EmitSrcAndTarget<K, EV>())
+	public static <K, EV> DataSet<Vertex<K, NullValue>> vertexSet(DataSet<Edge<K, EV>> edges, int parallelism) {
+		DataSet<Vertex<K, NullValue>> vertexSet = edges
+			.flatMap(new EmitSrcAndTarget<>())
 				.setParallelism(parallelism)
 				.name("Emit source and target labels");
 
 		return vertexSet
 			.distinct()
+			.setCombineHint(CombineHint.HASH)
 				.setParallelism(parallelism)
 				.name("Emit vertex labels");
 	}
@@ -99,13 +119,12 @@ public class GraphGeneratorUtils {
 	/**
 	 * @see Graph.EmitSrcAndTarget
 	 */
-	private static final class EmitSrcAndTarget<K,EV>
-	implements FlatMapFunction<Edge<K,EV>, Vertex<K,NullValue>> {
-
-		private Vertex<K,NullValue> output = new Vertex<>(null, new NullValue());
+	private static final class EmitSrcAndTarget<K, EV>
+	implements FlatMapFunction<Edge<K, EV>, Vertex<K, NullValue>> {
+		private Vertex<K, NullValue> output = new Vertex<>(null, new NullValue());
 
 		@Override
-		public void flatMap(Edge<K,EV> value, Collector<Vertex<K,NullValue>> out) throws Exception {
+		public void flatMap(Edge<K, EV> value, Collector<Vertex<K, NullValue>> out) throws Exception {
 			output.f0 = value.f0;
 			out.collect(output);
 			output.f0 = value.f1;

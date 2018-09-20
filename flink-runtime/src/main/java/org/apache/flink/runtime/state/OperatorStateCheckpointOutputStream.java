@@ -66,10 +66,16 @@ public final class OperatorStateCheckpointOutputStream
 			startNewPartition();
 		}
 
-		Map<String, long[]> offsetsMap = new HashMap<>(1);
-		offsetsMap.put(DefaultOperatorStateBackend.DEFAULT_OPERATOR_STATE_NAME, partitionOffsets.toArray());
+		Map<String, OperatorStateHandle.StateMetaInfo> offsetsMap = new HashMap<>(1);
 
-		return new OperatorStateHandle(offsetsMap, streamStateHandle);
+		OperatorStateHandle.StateMetaInfo metaInfo =
+				new OperatorStateHandle.StateMetaInfo(
+						partitionOffsets.toArray(),
+					OperatorStateHandle.Mode.SPLIT_DISTRIBUTE);
+
+		offsetsMap.put(DefaultOperatorStateBackend.DEFAULT_OPERATOR_STATE_NAME, metaInfo);
+
+		return new OperatorStreamStateHandle(offsetsMap, streamStateHandle);
 	}
 
 	public int getNumberOfPartitions() {

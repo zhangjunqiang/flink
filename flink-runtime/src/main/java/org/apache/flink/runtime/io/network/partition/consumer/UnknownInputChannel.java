@@ -18,17 +18,16 @@
 
 package org.apache.flink.runtime.io.network.partition.consumer;
 
-import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
 import org.apache.flink.runtime.event.TaskEvent;
 import org.apache.flink.runtime.io.network.ConnectionID;
 import org.apache.flink.runtime.io.network.ConnectionManager;
 import org.apache.flink.runtime.io.network.TaskEventDispatcher;
-import org.apache.flink.runtime.io.network.api.reader.BufferReader;
-import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionManager;
+import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
 
 import java.io.IOException;
+import java.util.Optional;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -36,7 +35,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * An input channel place holder to be replaced by either a {@link RemoteInputChannel}
  * or {@link LocalInputChannel} at runtime.
  */
-public class UnknownInputChannel extends InputChannel {
+class UnknownInputChannel extends InputChannel {
 
 	private final ResultPartitionManager partitionManager;
 
@@ -62,7 +61,7 @@ public class UnknownInputChannel extends InputChannel {
 			int maxBackoff,
 			TaskIOMetricGroup metrics) {
 
-		super(gate, channelIndex, partitionId, initialBackoff, maxBackoff, null);
+		super(gate, channelIndex, partitionId, initialBackoff, maxBackoff, null, null);
 
 		this.partitionManager = checkNotNull(partitionManager);
 		this.taskEventDispatcher = checkNotNull(taskEventDispatcher);
@@ -78,9 +77,9 @@ public class UnknownInputChannel extends InputChannel {
 	}
 
 	@Override
-	public Buffer getNextBuffer() throws IOException {
+	public Optional<BufferAndAvailability> getNextBuffer() throws IOException {
 		// Nothing to do here
-		return null;
+		throw new UnsupportedOperationException("Cannot retrieve a buffer from an UnknownInputChannel");
 	}
 
 	@Override
@@ -90,11 +89,10 @@ public class UnknownInputChannel extends InputChannel {
 
 	/**
 	 * Returns <code>false</code>.
-	 * <p>
-	 * <strong>Important</strong>: It is important that the method correctly
+	 *
+	 * <p><strong>Important</strong>: It is important that the method correctly
 	 * always <code>false</code> for unknown input channels in order to not
-	 * finish the consumption of an intermediate result partition early in
-	 * {@link BufferReader}.
+	 * finish the consumption of an intermediate result partition early.
 	 */
 	@Override
 	public boolean isReleased() {

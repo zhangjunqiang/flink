@@ -16,20 +16,18 @@
  * limitations under the License.
  */
 
-
 package org.apache.flink.core.fs.local;
-
-import java.io.File;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.core.fs.FileStatus;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
 
+import java.io.File;
+
 /**
  * The class <code>LocalFileStatus</code> provides an implementation of the {@link FileStatus} interface
  * for the local file system.
- * 
  */
 @Internal
 public class LocalFileStatus implements FileStatus {
@@ -46,7 +44,7 @@ public class LocalFileStatus implements FileStatus {
 
 	/**
 	 * Creates a <code>LocalFileStatus</code> object from a given {@link File} object.
-	 * 
+	 *
 	 * @param f
 	 *        the {@link File} object this <code>LocalFileStatus</code> refers to
 	 * @param fs
@@ -57,48 +55,41 @@ public class LocalFileStatus implements FileStatus {
 		this.path = new Path(fs.getUri().getScheme() + ":" + f.toURI().getPath());
 	}
 
-
 	@Override
 	public long getAccessTime() {
 		return 0; // We don't have access files for local files
 	}
-
 
 	@Override
 	public long getBlockSize() {
 		return this.file.length();
 	}
 
-
 	@Override
 	public long getLen() {
 		return this.file.length();
 	}
-
 
 	@Override
 	public long getModificationTime() {
 		return this.file.lastModified();
 	}
 
-
 	@Override
 	public short getReplication() {
 		return 1; // For local files replication is always 1
 	}
-
 
 	@Override
 	public boolean isDir() {
 		return this.file.isDirectory();
 	}
 
-
 	@Override
 	public Path getPath() {
 		return this.path;
 	}
-	
+
 	public File getFile() {
 		return this.file;
 	}

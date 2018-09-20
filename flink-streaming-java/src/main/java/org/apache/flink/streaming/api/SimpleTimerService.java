@@ -15,6 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.streaming.api;
 
 import org.apache.flink.annotation.Internal;
@@ -51,5 +52,15 @@ public class SimpleTimerService implements TimerService {
 	@Override
 	public void registerEventTimeTimer(long time) {
 		internalTimerService.registerEventTimeTimer(VoidNamespace.INSTANCE, time);
+	}
+
+	@Override
+	public void deleteProcessingTimeTimer(long time) {
+		internalTimerService.deleteProcessingTimeTimer(VoidNamespace.INSTANCE, time);
+	}
+
+	@Override
+	public void deleteEventTimeTimer(long time) {
+		internalTimerService.deleteEventTimeTimer(VoidNamespace.INSTANCE, time);
 	}
 }

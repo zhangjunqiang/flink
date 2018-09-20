@@ -33,11 +33,11 @@ angular.module('flinkApp')
 .controller 'SingleTaskManagerController', ($scope, $stateParams, SingleTaskManagerService, $interval, flinkConfig) ->
   $scope.metrics = {}
   SingleTaskManagerService.loadMetrics($stateParams.taskmanagerid).then (data) ->
-      $scope.metrics = data[0]
+      $scope.metrics = data
 
     refresh = $interval ->
       SingleTaskManagerService.loadMetrics($stateParams.taskmanagerid).then (data) ->
-        $scope.metrics = data[0]
+        $scope.metrics = data
     , flinkConfig["refresh-interval"]
 
     $scope.$on '$destroy', ->
@@ -45,6 +45,7 @@ angular.module('flinkApp')
 
 .controller 'SingleTaskManagerLogsController', ($scope, $stateParams, SingleTaskManagerService, $interval, flinkConfig) ->
   $scope.log = {}
+  $scope.taskmanagerid = $stateParams.taskmanagerid
   SingleTaskManagerService.loadLogs($stateParams.taskmanagerid).then (data) ->
     $scope.log = data
 
@@ -52,17 +53,12 @@ angular.module('flinkApp')
     SingleTaskManagerService.loadLogs($stateParams.taskmanagerid).then (data) ->
       $scope.log = data
 
-  $scope.downloadData = () ->
-    window.location.href = "/taskmanagers/" + ($stateParams.taskmanagerid) + "/log"
-
 .controller 'SingleTaskManagerStdoutController', ($scope, $stateParams, SingleTaskManagerService, $interval, flinkConfig) ->
   $scope.stdout = {}
+  $scope.taskmanagerid = $stateParams.taskmanagerid
   SingleTaskManagerService.loadStdout($stateParams.taskmanagerid).then (data) ->
     $scope.stdout = data
 
   $scope.reloadData = () ->
     SingleTaskManagerService.loadStdout($stateParams.taskmanagerid).then (data) ->
       $scope.stdout = data
-
-  $scope.downloadData = () ->
-    window.location.href = "/taskmanagers/" + ($stateParams.taskmanagerid) + "/stdout"

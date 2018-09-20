@@ -20,6 +20,8 @@ package org.apache.flink.runtime.util;
 
 import org.apache.flink.util.Preconditions;
 
+import javax.annotation.Nonnull;
+
 import java.io.Serializable;
 import java.util.ConcurrentModificationException;
 import java.util.Iterator;
@@ -29,8 +31,9 @@ import java.util.NoSuchElementException;
  * This class implements a list (array based) that is physically bounded in maximum size, but can virtually grow beyond
  * the bounded size. When the list grows beyond the size bound, elements are dropped from the head of the list (FIFO
  * order). If dropped elements are accessed, a default element is returned instead.
- * <p>
- * TODO this class could eventually implement the whole actual List interface.
+ * 
+ * <p>The list by itself is serializable, but a full list can only be serialized if the values
+ * are also serializable.
  *
  * @param <T> type of the list elements
  */
@@ -38,11 +41,24 @@ public class EvictingBoundedList<T> implements Iterable<T>, Serializable {
 
 	private static final long serialVersionUID = -1863961980953613146L;
 
+	@SuppressWarnings("NonSerializableFieldInSerializableClass")
+	/** the default element returned for positions that were evicted */
 	private final T defaultElement;
+
+	@SuppressWarnings("NonSerializableFieldInSerializableClass")
+	/** the array (viewed as a circular buffer) that holds the latest (= non-evicted) elements */
 	private final Object[] elements;
+
+	/** The next index to put an element in the array */
 	private int idx;
+
+	/** The current number of (virtual) elements in the list */
 	private int count;
+
+	/** Modification count for fail-fast iterators */
 	private long modCount;
+
+	// ------------------------------------------------------------------------
 
 	public EvictingBoundedList(int sizeLimit) {
 		this(sizeLimit, null);
@@ -64,6 +80,8 @@ public class EvictingBoundedList<T> implements Iterable<T>, Serializable {
 		this.count = 0;
 		this.modCount = 0L;
 	}
+
+	// ------------------------------------------------------------------------
 
 	public int size() {
 		return count;
@@ -93,8 +111,11 @@ public class EvictingBoundedList<T> implements Iterable<T>, Serializable {
 	}
 
 	public T get(int index) {
-		Preconditions.checkArgument(index >= 0 && index < count);
-		return isDroppedIndex(index) ? getDefaultElement() : accessInternal(index % elements.length);
+		if (index >= 0 && index < count) {
+			return isDroppedIndex(index) ? getDefaultElement() : accessInternal(index % elements.length);
+		} else {
+			throw new IndexOutOfBoundsException(String.valueOf(index));
+		}
 	}
 
 	public int getSizeLimit() {
@@ -127,6 +148,7 @@ public class EvictingBoundedList<T> implements Iterable<T>, Serializable {
 		return (T) elements[arrayIndex];
 	}
 
+	@Nonnull
 	@Override
 	public Iterator<T> iterator() {
 		return new Iterator<T>() {

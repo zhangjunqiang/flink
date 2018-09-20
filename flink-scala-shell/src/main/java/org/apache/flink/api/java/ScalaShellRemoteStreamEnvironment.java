@@ -15,6 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.api.java;
 
 import org.apache.flink.api.common.JobExecutionResult;
@@ -25,6 +26,7 @@ import org.apache.flink.streaming.api.environment.RemoteStreamEnvironment;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironmentFactory;
 import org.apache.flink.streaming.api.graph.StreamGraph;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,12 +35,15 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 
-
+/**
+ * A {@link RemoteStreamEnvironment} for the Scala shell.
+ */
 public class ScalaShellRemoteStreamEnvironment extends RemoteStreamEnvironment {
 	private static final Logger LOG = LoggerFactory.getLogger(ScalaShellRemoteStreamEnvironment.class);
 
 	// reference to Scala Shell, for access to virtual directory
 	private FlinkILoop flinkILoop;
+
 	/**
 	 * Creates a new RemoteStreamEnvironment that points to the master
 	 * (JobManager) described by the given host name and port.
@@ -62,6 +67,7 @@ public class ScalaShellRemoteStreamEnvironment extends RemoteStreamEnvironment {
 		super(host, port, configuration, jarFiles);
 		this.flinkILoop = flinkILoop;
 	}
+
 	/**
 	 * Executes the remote job.
 	 *
@@ -77,7 +83,8 @@ public class ScalaShellRemoteStreamEnvironment extends RemoteStreamEnvironment {
 		try {
 			jarUrl = flinkILoop.writeFilesToDisk().getAbsoluteFile().toURI().toURL();
 		} catch (MalformedURLException e) {
-			throw new ProgramInvocationException("Could not write the user code classes to disk.", e);
+			throw new ProgramInvocationException("Could not write the user code classes to disk.",
+				streamGraph.getJobGraph().getJobID(), e);
 		}
 
 		List<URL> allJarFiles = new ArrayList<>(jarFiles.size() + 1);
@@ -97,7 +104,6 @@ public class ScalaShellRemoteStreamEnvironment extends RemoteStreamEnvironment {
 		};
 		initializeContextEnvironment(factory);
 	}
-
 
 	public static void disableAllContextAndOtherEnvironments() {
 		// we create a context environment that prevents the instantiation of further

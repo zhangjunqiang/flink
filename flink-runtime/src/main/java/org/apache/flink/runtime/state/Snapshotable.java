@@ -18,28 +18,24 @@
 
 package org.apache.flink.runtime.state;
 
-import java.util.concurrent.RunnableFuture;
+import org.apache.flink.annotation.Internal;
+
+import javax.annotation.Nullable;
 
 /**
- * Interface for operations that can perform snapshots of their state.
+ * Interface for operators that can perform snapshots of their state.
  *
  * @param <S> Generic type of the state object that is created as handle to snapshots.
+ * @param <R> Generic type of the state object that used in restore.
  */
-public interface Snapshotable<S extends StateObject> {
+@Internal
+public interface Snapshotable<S extends StateObject, R> extends SnapshotStrategy<S> {
 
 	/**
-	 * Operation that writes a snapshot into a stream that is provided by the given {@link CheckpointStreamFactory} and
-	 * returns a @{@link RunnableFuture} that gives a state handle to the snapshot. It is up to the implementation if
-	 * the operation is performed synchronous or asynchronous. In the later case, the returned Runnable must be executed
-	 * first before obtaining the handle.
+	 * Restores state that was previously snapshotted from the provided parameters. Typically the parameters are state
+	 * handles from which the old state is read.
 	 *
-	 * @param checkpointId  The ID of the checkpoint.
-	 * @param timestamp     The timestamp of the checkpoint.
-	 * @param streamFactory The factory that we can use for writing our state to streams.
-	 * @return A runnable future that will yield a {@link StateObject}.
+	 * @param state the old state to restore.
 	 */
-	RunnableFuture<S> snapshot(
-			long checkpointId,
-			long timestamp,
-			CheckpointStreamFactory streamFactory) throws Exception;
+	void restore(@Nullable R state) throws Exception;
 }

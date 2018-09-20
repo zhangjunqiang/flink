@@ -18,10 +18,12 @@
 
 package org.apache.flink.runtime.jobmanager
 
-import java.io.{File, IOException}
+import java.io.IOException
 import java.net._
+import java.util
 import java.util.UUID
 import java.util.concurrent.{TimeUnit, Future => _, TimeoutException => _, _}
+import java.util.function.{BiFunction, Consumer}
 
 import akka.actor.Status.{Failure, Success}
 import akka.actor._
@@ -29,60 +31,62 @@ import akka.pattern.ask
 import grizzled.slf4j.Logger
 import org.apache.flink.api.common.JobID
 import org.apache.flink.api.common.time.Time
-import org.apache.flink.configuration.{ConfigConstants, Configuration, GlobalConfiguration, HighAvailabilityOptions}
-import org.apache.flink.core.fs.FileSystem
+import org.apache.flink.configuration._
+import org.apache.flink.core.fs.{FileSystem, Path}
 import org.apache.flink.core.io.InputSplitAssigner
-import org.apache.flink.metrics.groups.UnregisteredMetricsGroup
 import org.apache.flink.metrics.{Gauge, MetricGroup}
 import org.apache.flink.runtime.accumulators.AccumulatorSnapshot
 import org.apache.flink.runtime.akka.{AkkaUtils, ListeningBehaviour}
-import org.apache.flink.runtime.blob.BlobServer
+import org.apache.flink.runtime.blob.{BlobServer, BlobStore}
 import org.apache.flink.runtime.checkpoint._
-import org.apache.flink.runtime.checkpoint.savepoint.{SavepointLoader, SavepointStore}
 import org.apache.flink.runtime.client._
-import org.apache.flink.runtime.clusterframework.FlinkResourceManager
 import org.apache.flink.runtime.clusterframework.messages._
 import org.apache.flink.runtime.clusterframework.standalone.StandaloneResourceManager
 import org.apache.flink.runtime.clusterframework.types.ResourceID
-import org.apache.flink.runtime.concurrent.{AcceptFunction, BiFunction, Executors => FlinkExecutors}
+import org.apache.flink.runtime.clusterframework.{BootstrapTools, FlinkResourceManager}
+import org.apache.flink.runtime.concurrent.Executors.directExecutionContext
+import org.apache.flink.runtime.concurrent.{FutureUtils, ScheduledExecutorServiceAdapter}
 import org.apache.flink.runtime.execution.SuppressRestartsException
-import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager
-import org.apache.flink.runtime.executiongraph.restart.RestartStrategyFactory
+import org.apache.flink.runtime.execution.librarycache.FlinkUserCodeClassLoaders.ResolveOrder
+import org.apache.flink.runtime.execution.librarycache.{BlobLibraryCacheManager, LibraryCacheManager}
 import org.apache.flink.runtime.executiongraph._
+import org.apache.flink.runtime.executiongraph.restart.{RestartStrategyFactory, RestartStrategyResolving}
+import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils.AddressResolution
+import org.apache.flink.runtime.highavailability.{HighAvailabilityServices, HighAvailabilityServicesUtils}
 import org.apache.flink.runtime.instance.{AkkaActorGateway, InstanceID, InstanceManager}
-import org.apache.flink.runtime.io.network.PartitionState
 import org.apache.flink.runtime.jobgraph.{JobGraph, JobStatus}
 import org.apache.flink.runtime.jobmanager.SubmittedJobGraphStore.SubmittedJobGraphListener
 import org.apache.flink.runtime.jobmanager.scheduler.{Scheduler => FlinkScheduler}
 import org.apache.flink.runtime.jobmanager.slots.ActorTaskManagerGateway
-import org.apache.flink.runtime.leaderelection.{LeaderContender, LeaderElectionService, StandaloneLeaderElectionService}
+import org.apache.flink.runtime.jobmaster.JobMaster
+import org.apache.flink.runtime.leaderelection.{LeaderContender, LeaderElectionService}
 import org.apache.flink.runtime.messages.ArchiveMessages.ArchiveExecutionGraph
 import org.apache.flink.runtime.messages.ExecutionGraphMessages.JobStatusChanged
 import org.apache.flink.runtime.messages.JobManagerMessages._
 import org.apache.flink.runtime.messages.Messages.Disconnect
 import org.apache.flink.runtime.messages.RegistrationMessages._
-import org.apache.flink.runtime.messages.{Acknowledge, StackTrace}
 import org.apache.flink.runtime.messages.TaskManagerMessages.Heartbeat
 import org.apache.flink.runtime.messages.TaskMessages.UpdateTaskExecutionState
 import org.apache.flink.runtime.messages.accumulators._
 import org.apache.flink.runtime.messages.checkpoint.{AbstractCheckpointMessage, AcknowledgeCheckpoint, DeclineCheckpoint}
+import org.apache.flink.runtime.messages.webmonitor.JobIdsWithStatusOverview.JobIdWithStatus
 import org.apache.flink.runtime.messages.webmonitor.{InfoMessage, _}
+import org.apache.flink.runtime.messages.{Acknowledge, FlinkJobNotFoundException, StackTrace}
 import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup
-import org.apache.flink.runtime.metrics.{MetricRegistryConfiguration, MetricRegistry => FlinkMetricRegistry}
 import org.apache.flink.runtime.metrics.util.MetricUtils
+import org.apache.flink.runtime.metrics.{MetricRegistryConfiguration, MetricRegistryImpl, MetricRegistry => FlinkMetricRegistry}
 import org.apache.flink.runtime.process.ProcessReaper
 import org.apache.flink.runtime.query.KvStateMessage.{LookupKvStateLocation, NotifyKvStateRegistered, NotifyKvStateUnregistered}
 import org.apache.flink.runtime.query.{KvStateMessage, UnknownKvStateLocation}
-import org.apache.flink.runtime.security.SecurityContext
-import org.apache.flink.runtime.security.SecurityContext.{FlinkSecuredRunner, SecurityConfiguration}
+import org.apache.flink.runtime.security.{SecurityConfiguration, SecurityUtils}
+import org.apache.flink.runtime.taskexecutor.TaskExecutor
 import org.apache.flink.runtime.taskmanager.TaskManager
 import org.apache.flink.runtime.util._
+import org.apache.flink.runtime.webmonitor.retriever.impl.{AkkaJobManagerRetriever, AkkaQueryServiceRetriever}
 import org.apache.flink.runtime.webmonitor.{WebMonitor, WebMonitorUtils}
 import org.apache.flink.runtime.{FlinkActor, LeaderSessionMessageFilter, LogMessages}
-import org.apache.flink.util.{ConfigurationUtil, InstantiationUtil, NetUtils}
-import org.jboss.netty.channel.ChannelException
+import org.apache.flink.util._
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.concurrent._
@@ -118,10 +122,11 @@ import scala.language.postfixOps
  */
 class JobManager(
     protected val flinkConfiguration: Configuration,
-    protected val futureExecutor: Executor,
+    protected val futureExecutor: ScheduledExecutorService,
     protected val ioExecutor: Executor,
     protected val instanceManager: InstanceManager,
     protected val scheduler: FlinkScheduler,
+    protected val blobServer: BlobServer,
     protected val libraryCacheManager: BlobLibraryCacheManager,
     protected val archive: ActorRef,
     protected val restartStrategyFactory: RestartStrategyFactory,
@@ -130,7 +135,8 @@ class JobManager(
     protected val submittedJobGraphs : SubmittedJobGraphStore,
     protected val checkpointRecoveryFactory : CheckpointRecoveryFactory,
     protected val jobRecoveryTimeout: FiniteDuration,
-    protected val metricsRegistry: Option[FlinkMetricRegistry])
+    protected val jobManagerMetricGroup: JobManagerMetricGroup,
+    protected val optRestAddress: Option[String])
   extends FlinkActor
   with LeaderSessionMessageFilter // mixin oder is important, we want filtering after logging
   with LogMessages // mixin order is important, we want first logging
@@ -146,40 +152,23 @@ class JobManager(
 
   var leaderSessionID: Option[UUID] = None
 
-  protected val jobManagerMetricGroup : Option[JobManagerMetricGroup] = metricsRegistry match {
-    case Some(registry) =>
-      val host = flinkConfiguration.getString(ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY, null)
-      Option(new JobManagerMetricGroup(
-        registry, NetUtils.ipAddressToUrlString(InetAddress.getByName(host))))
-    case None =>
-      log.warn("Could not instantiate JobManager metrics.")
-      None
-  }
-
   /** Futures which have to be completed before terminating the job manager */
   var futuresToComplete: Option[Seq[Future[Unit]]] = None
 
-  /**
-   * The port of the web monitor as configured. Make sure that it is actually configured before
-   * starting the JobManager. This tightly couples the web monitor with the job manager. It is a
-   * temporary workaround until all execution graph components are properly serializable and all
-   * web monitors can transparently interact with each job manager. Currently each web server has
-   * to run in the actor system of the associated job manager.
-   */
-  val webMonitorPort : Int = flinkConfiguration.getInteger(
-    ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, -1)
-
   /** The default directory for savepoints. */
-  val defaultSavepointDir: String = ConfigurationUtil.getStringWithDeprecatedKeys(
-    flinkConfiguration,
-    ConfigConstants.SAVEPOINT_DIRECTORY_KEY,
-    null,
-    ConfigConstants.SAVEPOINT_FS_DIRECTORY_KEY)
+  val defaultSavepointDir: String = 
+    flinkConfiguration.getString(CheckpointingOptions.SAVEPOINT_DIRECTORY)
 
   /** The resource manager actor responsible for allocating and managing task manager resources. */
   var currentResourceManager: Option[ActorRef] = None
 
+  var currentResourceManagerConnectionId: Long = 0
+
   val taskManagerMap = mutable.Map[ActorRef, InstanceID]()
+
+  val triggerResourceManagerReconnectInterval = new FiniteDuration(
+    flinkConfiguration.getLong(JobManagerOptions.RESOURCE_MANAGER_RECONNECT_INTERVAL),
+    TimeUnit.MILLISECONDS)
 
   /**
    * Run when the job manager is started. Simply logs an informational message.
@@ -205,20 +194,7 @@ class JobManager(
         throw new RuntimeException("Could not start the submitted job graphs service.", e)
     }
 
-    try {
-      checkpointRecoveryFactory.start()
-    } catch {
-      case e: Exception =>
-        log.error("Could not start the checkpoint recovery service.", e)
-        throw new RuntimeException("Could not start the checkpoint recovery service.", e)
-    }
-
-    jobManagerMetricGroup match {
-      case Some(group) =>
-        instantiateMetrics(group)
-      case None =>
-        log.warn("Could not instantiate JobManager metrics.")
-    }
+    instantiateMetrics(jobManagerMetricGroup)
   }
 
   override def postStop(): Unit = {
@@ -254,30 +230,20 @@ class JobManager(
       case e: Exception => log.error("Could not properly stop the submitted job graphs service.")
     }
 
-    try {
-      checkpointRecoveryFactory.stop()
-    } catch {
-      case e: Exception => log.error("Could not properly stop the checkpoint recovery service.")
-    }
-
     if (archive != ActorRef.noSender) {
       archive ! decorateMessage(PoisonPill)
     }
 
+    jobManagerMetricGroup.close()
+
     instanceManager.shutdown()
     scheduler.shutdown()
+    libraryCacheManager.shutdown()
 
     try {
-      libraryCacheManager.shutdown()
+      blobServer.close()
     } catch {
-      case e: IOException => log.error("Could not properly shutdown the library cache manager.", e)
-    }
-
-    // failsafe shutdown of the metrics registry
-    try {
-      metricsRegistry.foreach(_.shutdown())
-    } catch {
-      case t: Exception => log.error("MetricRegistry did not shutdown properly.", t)
+      case e: IOException => log.error("Could not properly shutdown the blob server.", e)
     }
 
     log.debug(s"Job manager ${self.path} is completely stopped.")
@@ -338,6 +304,7 @@ class JobManager(
 
       // ditch current resource manager (if any)
       currentResourceManager = Option(msg.resourceManager())
+      currentResourceManagerConnectionId += 1
 
       val taskManagerResources = instanceManager.getAllRegisteredInstances.asScala.map(
         instance => instance.getTaskManagerID).toList.asJava
@@ -356,24 +323,25 @@ class JobManager(
       def reconnectRepeatedly(): Unit = {
         msg.resourceManager() ! decorateMessage(new TriggerRegistrationAtJobManager(self))
         // try again after some delay
-        context.system.scheduler.scheduleOnce(2 seconds) {
+        context.system.scheduler.scheduleOnce(triggerResourceManagerReconnectInterval) {
           self ! decorateMessage(msg)
         }(context.dispatcher)
       }
 
       currentResourceManager match {
-        case Some(rm) if rm.equals(msg.resourceManager()) =>
+        case Some(rm) if rm.equals(msg.resourceManager()) &&
+          currentResourceManagerConnectionId == msg.getConnectionId =>
           // we should ditch the current resource manager
           log.debug(s"Disconnecting resource manager $rm and forcing a reconnect.")
           currentResourceManager = None
           reconnectRepeatedly()
-        case Some(rm) =>
-          // we have registered with another ResourceManager in the meantime, stop sending
-          // TriggerRegistrationAtJobManager messages to the old ResourceManager
         case None =>
           log.warn(s"No resource manager ${msg.resourceManager()} connected. " +
             s"Telling old ResourceManager to register again.")
           reconnectRepeatedly()
+        case _ =>
+        // we have established a new connection to a ResourceManager in the meantime, stop sending
+        // TriggerRegistrationAtJobManager messages to the old ResourceManager
       }
 
     case msg @ RegisterTaskManager(
@@ -382,7 +350,7 @@ class JobManager(
           hardwareInformation,
           numberOfSlots) =>
       // we are being informed by the ResourceManager that a new task manager is available
-      log.debug(s"RegisterTaskManager: $msg")
+      log.info(s"RegisterTaskManager: $msg")
 
       val taskManager = sender()
 
@@ -397,7 +365,10 @@ class JobManager(
                 case _ =>
                   log.warn("Failure while asking ResourceManager for RegisterResource. Retrying", t)
               }
-              self ! decorateMessage(new ReconnectResourceManager(rm))
+              self ! decorateMessage(
+                new ReconnectResourceManager(
+                  rm,
+                  currentResourceManagerConnectionId))
           }(context.dispatcher)
 
         case None =>
@@ -411,7 +382,7 @@ class JobManager(
         taskManager ! decorateMessage(
           AlreadyRegistered(
             instanceID,
-            libraryCacheManager.getBlobServerPort))
+            blobServer.getPort))
       } else {
         try {
           val actorGateway = new AkkaActorGateway(taskManager, leaderSessionID.orNull)
@@ -426,7 +397,7 @@ class JobManager(
           taskManagerMap.put(taskManager, instanceID)
 
           taskManager ! decorateMessage(
-            AcknowledgeRegistration(instanceID, libraryCacheManager.getBlobServerPort))
+            AcknowledgeRegistration(instanceID, blobServer.getPort))
 
           // to be notified when the taskManager is no longer reachable
           context.watch(taskManager)
@@ -455,7 +426,7 @@ class JobManager(
           taskManagerGateway match {
             case x: ActorTaskManagerGateway =>
               handleTaskManagerTerminated(x.getActorGateway().actor(), instance.getId)
-            case _ => log.debug(s"Cannot remove reosurce ${resourceID}, because there is " +
+            case _ => log.debug(s"Cannot remove resource ${resourceID}, because there is " +
                                   s"no ActorRef registered.")
           }
 
@@ -495,6 +466,8 @@ class JobManager(
 
     case RecoverSubmittedJob(submittedJobGraph) =>
       if (!currentJobs.contains(submittedJobGraph.getJobId)) {
+        log.info(s"Submitting recovered job ${submittedJobGraph.getJobId}.")
+
         submitJob(
           submittedJobGraph.getJobGraph(),
           submittedJobGraph.getJobInfo(),
@@ -516,9 +489,10 @@ class JobManager(
             log.info(s"Attempting to recover job $jobId.")
             val submittedJobGraphOption = submittedJobGraphs.recoverJobGraph(jobId)
 
-            submittedJobGraphOption match {
+            Option(submittedJobGraphOption) match {
               case Some(submittedJobGraph) =>
-                if (!leaderElectionService.hasLeadership()) {
+                if (leaderSessionID.isEmpty ||
+                  !leaderElectionService.hasLeadership(leaderSessionID.get)) {
                   // we've lost leadership. mission: abort.
                   log.warn(s"Lost leadership during recovery. Aborting recovery of $jobId.")
                 } else {
@@ -529,37 +503,38 @@ class JobManager(
             }
           }
         } catch {
-          case t: Throwable => log.error(s"Failed to recover job $jobId.", t)
+          case t: Throwable => {
+            log.error(s"Failed to recover job $jobId.", t)
+            // stop one self in order to be restarted and trying to recover the jobs again
+            context.stop(self)
+          }
         }
       }(context.dispatcher)
 
     case RecoverAllJobs =>
       future {
+        log.info("Attempting to recover all jobs.")
+
         try {
-          // The ActorRef, which is part of the submitted job graph can only be
-          // de-serialized in the scope of an actor system.
-          akka.serialization.JavaSerializer.currentSystem.withValue(
-            context.system.asInstanceOf[ExtendedActorSystem]) {
+          val jobIdsToRecover = submittedJobGraphs.getJobIds().asScala
 
-            log.info(s"Attempting to recover all jobs.")
+          if (jobIdsToRecover.isEmpty) {
+            log.info("There are no jobs to recover.")
+          } else {
+            log.info(s"There are ${jobIdsToRecover.size} jobs to recover. Starting the job " +
+                       s"recovery.")
 
-            val jobGraphs = submittedJobGraphs.recoverJobGraphs().asScala
-
-            if (!leaderElectionService.hasLeadership()) {
-              // we've lost leadership. mission: abort.
-              log.warn(s"Lost leadership during recovery. Aborting recovery of ${jobGraphs.size} " +
-                s"jobs.")
-            } else {
-              log.info(s"Re-submitting ${jobGraphs.size} job graphs.")
-
-              jobGraphs.foreach{
-                submittedJobGraph =>
-                  self ! decorateMessage(RecoverSubmittedJob(submittedJobGraph))
-              }
+            jobIdsToRecover foreach {
+              jobId => self ! decorateMessage(RecoverJob(jobId))
             }
           }
         } catch {
-          case t: Throwable => log.error("Fatal error: Failed to recover jobs.", t)
+          case e: Exception => {
+            log.error("Failed to recover job ids from submitted job graph store. Aborting " +
+              "recovery.", e)
+            // stop one self in order to be restarted and trying to recover the jobs again
+            context.stop(self)
+          }
         }
       }(context.dispatcher)
 
@@ -569,11 +544,11 @@ class JobManager(
       currentJobs.get(jobID) match {
         case Some((executionGraph, _)) =>
           // execute the cancellation asynchronously
+          val origSender = sender
           Future {
             executionGraph.cancel()
+            origSender ! decorateMessage(CancellationSuccess(jobID))
           }(context.dispatcher)
-
-          sender ! decorateMessage(CancellationSuccess(jobID))
         case None =>
           log.info(s"No job found with ID $jobID.")
           sender ! decorateMessage(
@@ -585,42 +560,63 @@ class JobManager(
 
     case CancelJobWithSavepoint(jobId, savepointDirectory) =>
       try {
-        val targetDirectory = if (savepointDirectory != null) {
-          savepointDirectory
-        } else {
-          defaultSavepointDir
-        }
-
-        log.info(s"Trying to cancel job $jobId with savepoint to $targetDirectory")
+        log.info(s"Trying to cancel job $jobId with savepoint to $savepointDirectory")
 
         currentJobs.get(jobId) match {
           case Some((executionGraph, _)) =>
-            // We don't want any checkpoint between the savepoint and cancellation
             val coord = executionGraph.getCheckpointCoordinator
-            coord.stopCheckpointScheduler()
 
-            // Trigger the savepoint
-            val future = coord.triggerSavepoint(System.currentTimeMillis(), targetDirectory)
+            if (coord == null) {
+              sender ! decorateMessage(CancellationFailure(jobId, new IllegalStateException(
+                s"Job $jobId is not a streaming job.")))
+            }
+            else if (savepointDirectory == null &&
+                  !coord.getCheckpointStorage.hasDefaultSavepointLocation) {
+              log.info(s"Trying to cancel job $jobId with savepoint, but no " +
+                "savepoint directory configured.")
 
-            val senderRef = sender()
-            future.handleAsync[Void](
-              new BiFunction[CompletedCheckpoint, Throwable, Void] {
-                override def apply(success: CompletedCheckpoint, cause: Throwable): Void = {
-                  if (success != null) {
-                    val path = success.getExternalPath()
-                    log.info(s"Savepoint stored in $path. Now cancelling $jobId.")
-                    executionGraph.cancel()
-                    senderRef ! decorateMessage(CancellationSuccess(jobId, path))
-                  } else {
-                    val msg = CancellationFailure(
-                      jobId,
-                      new Exception("Failed to trigger savepoint.", cause))
-                    senderRef ! decorateMessage(msg)
+              sender ! decorateMessage(CancellationFailure(jobId, new IllegalStateException(
+                "No savepoint directory configured. You can either specify a directory " +
+                  "while cancelling via -s :targetDirectory or configure a cluster-wide " +
+                  "default via key '" + CheckpointingOptions.SAVEPOINT_DIRECTORY.key() + "'.")))
+            } else {
+              // We don't want any checkpoint between the savepoint and cancellation
+              coord.stopCheckpointScheduler()
+
+              // Trigger the savepoint
+              val future = coord.triggerSavepoint(System.currentTimeMillis(), savepointDirectory)
+
+              val senderRef = sender()
+              future.handleAsync[Void](
+                new BiFunction[CompletedCheckpoint, Throwable, Void] {
+                  override def apply(success: CompletedCheckpoint, cause: Throwable): Void = {
+                    if (success != null) {
+                      val path = success.getExternalPointer()
+                      log.info(s"Savepoint stored in $path. Now cancelling $jobId.")
+                      executionGraph.cancel()
+                      senderRef ! decorateMessage(CancellationSuccess(jobId, path))
+                    } else {
+                      // Restart checkpoint scheduler iff periodic checkpoints are configured.
+                      // Otherwise we have unintended side effects on the job.
+                      if (coord.isPeriodicCheckpointingConfigured) {
+                        try {
+                          coord.startCheckpointScheduler()
+                        } catch {
+                          case ignored: IllegalStateException =>
+                            // Concurrent shut down of the coordinator
+                        }
+                      }
+
+                      val msg = CancellationFailure(
+                        jobId,
+                        new Exception("Failed to trigger savepoint.", cause))
+                      senderRef ! decorateMessage(msg)
+                    }
+                    null
                   }
-                  null
-                }
-              },
-              context.dispatcher)
+                },
+                context.dispatcher)
+            }
 
           case None =>
             log.info(s"No job found with ID $jobId.")
@@ -758,32 +754,40 @@ class JobManager(
         case Some((graph, _)) =>
           val checkpointCoordinator = graph.getCheckpointCoordinator()
 
-          if (checkpointCoordinator != null) {
+          if (checkpointCoordinator == null) {
+            sender ! decorateMessage(TriggerSavepointFailure(jobId, new IllegalStateException(
+              s"Job $jobId is not a streaming job.")))
+          }
+          else if (savepointDirectory.isEmpty &&
+                !checkpointCoordinator.getCheckpointStorage.hasDefaultSavepointLocation) {
+            log.info(s"Trying to trigger a savepoint, but no savepoint directory configured.")
+
+            sender ! decorateMessage(TriggerSavepointFailure(jobId, new IllegalStateException(
+              "No savepoint directory configured. You can either specify a directory " +
+                "when triggering the savepoint via -s :targetDirectory or configure a " +
+                "cluster-/application-wide default via key '" +
+                CheckpointingOptions.SAVEPOINT_DIRECTORY.key() + "'.")))
+          } else {
             // Immutable copy for the future
             val senderRef = sender()
             try {
-              val targetDirectory : String = savepointDirectory.getOrElse(
-                flinkConfiguration.getString(ConfigConstants.SAVEPOINT_DIRECTORY_KEY, null))
-
-              if (targetDirectory == null) {
-                throw new IllegalStateException("No savepoint directory configured. " +
-                  "You can either specify a directory when triggering this savepoint or " +
-                  "configure a cluster-wide default via key '" +
-                  ConfigConstants.SAVEPOINT_DIRECTORY_KEY + "'.")
-              }
-
               // Do this async, because checkpoint coordinator operations can
               // contain blocking calls to the state backend or ZooKeeper.
               val savepointFuture = checkpointCoordinator.triggerSavepoint(
                 System.currentTimeMillis(),
-                targetDirectory)
+                savepointDirectory.orNull)
 
               savepointFuture.handleAsync[Void](
                 new BiFunction[CompletedCheckpoint, Throwable, Void] {
                   override def apply(success: CompletedCheckpoint, cause: Throwable): Void = {
                     if (success != null) {
-                      if (success.getExternalPath != null) {
-                        senderRef ! TriggerSavepointSuccess(jobId, success.getExternalPath)
+                      if (success.getExternalPointer != null) {
+                        senderRef ! TriggerSavepointSuccess(
+                          jobId,
+                          success.getCheckpointID,
+                          success.getExternalPointer,
+                          success.getTimestamp
+                        )
                       } else {
                         senderRef ! TriggerSavepointFailure(
                           jobId, new Exception("Savepoint has not been persisted."))
@@ -801,10 +805,6 @@ class JobManager(
                 senderRef ! TriggerSavepointFailure(jobId, new Exception(
                   "Failed to trigger savepoint", e))
             }
-          } else {
-            sender() ! TriggerSavepointFailure(jobId, new IllegalStateException(
-              "Checkpointing disabled. You can enable it via the execution environment of " +
-                "your job."))
           }
 
         case None =>
@@ -817,15 +817,12 @@ class JobManager(
         try {
           log.info(s"Disposing savepoint at '$savepointPath'.")
 
-          val savepoint = SavepointStore.loadSavepoint(savepointPath)
+          // there is a corner case issue with Flink 1.1 savepoints, which may contain
+          // user-defined state handles. however, it should work for all the standard cases,
+          // where the mem/fs/rocks state backends were used
+          val classLoader = Thread.currentThread().getContextClassLoader
 
-          log.debug(s"$savepoint")
-
-          // Dispose checkpoint state
-          savepoint.dispose()
-
-          // Remove the header file
-          SavepointStore.removeSavepoint(savepointPath)
+          Checkpoints.disposeSavepoint(savepointPath, flinkConfiguration, classLoader, log.logger)
 
           senderRef ! DisposeSavepointSuccess
         } catch {
@@ -836,7 +833,7 @@ class JobManager(
         }
       }(context.dispatcher)
 
-    case JobStatusChanged(jobID, newJobStatus, timeStamp, error) =>
+    case msg @ JobStatusChanged(jobID, newJobStatus, timeStamp, error) =>
       currentJobs.get(jobID) match {
         case Some((executionGraph, jobInfo)) => executionGraph.getJobName
 
@@ -911,8 +908,7 @@ class JobManager(
               }
             }(context.dispatcher)
           }
-        case None =>
-          self ! decorateMessage(RemoveJob(jobID, removeJobFromStateBackend = true))
+        case None => log.debug(s"Received $msg for nonexistent job $jobID.")
       }
 
     case ScheduleOrUpdateConsumers(jobId, partitionId) =>
@@ -938,26 +934,57 @@ class JobManager(
           )
       }
 
-    case RequestPartitionState(jobId, partitionId, taskExecutionId, taskResultId) =>
-      val state = currentJobs.get(jobId) match {
+    case RequestPartitionProducerState(jobId, intermediateDataSetId, resultPartitionId) =>
+      currentJobs.get(jobId) match {
         case Some((executionGraph, _)) =>
-          val execution = executionGraph.getRegisteredExecutions.get(partitionId.getProducerId)
+          try {
+            // Find the execution attempt producing the intermediate result partition.
+            val execution = executionGraph
+              .getRegisteredExecutions
+              .get(resultPartitionId.getProducerId)
 
-          if (execution != null) execution.getState else null
+            if (execution != null) {
+              // Common case for pipelined exchanges => producing execution is
+              // still active.
+              sender ! decorateMessage(execution.getState)
+            } else {
+              // The producing execution might have terminated and been
+              // unregistered. We now look for the producing execution via the
+              // intermediate result itself.
+              val intermediateResult = executionGraph
+                .getAllIntermediateResults.get(intermediateDataSetId)
+
+              if (intermediateResult != null) {
+                // Try to find the producing execution
+                val producerExecution = intermediateResult
+                  .getPartitionById(resultPartitionId.getPartitionId)
+                  .getProducer
+                  .getCurrentExecutionAttempt
+
+                if (producerExecution.getAttemptId() == resultPartitionId.getProducerId()) {
+                  sender ! decorateMessage(producerExecution.getState)
+                } else {
+                  val cause = new PartitionProducerDisposedException(resultPartitionId)
+                  sender ! decorateMessage(Status.Failure(cause))
+                }
+              } else {
+                val cause = new IllegalArgumentException(
+                  s"Intermediate data set with ID $intermediateDataSetId not found.")
+                sender ! decorateMessage(Status.Failure(cause))
+              }
+            }
+          } catch {
+            case e: Exception =>
+              sender ! decorateMessage(
+                Status.Failure(new RuntimeException("Failed to look up execution state of " +
+                  s"producer with ID ${resultPartitionId.getProducerId}.", e)))
+          }
+
         case None =>
-          // Nothing to do. This is not an error, because the request is received when a sending
-          // task fails or is not yet available during a remote partition request.
-          log.debug(s"Cannot find execution graph for job $jobId.")
+          sender ! decorateMessage(
+            Status.Failure(new IllegalArgumentException(s"Job with ID $jobId not found.")))
 
-          null
       }
-
-      sender ! decorateMessage(
-        new PartitionState(
-          taskResultId,
-          partitionId.getPartitionId,
-          state)
-      )
 
     case RequestJobStatus(jobID) =>
       currentJobs.get(jobID) match {
@@ -1006,7 +1033,7 @@ class JobManager(
         case Some((graph, jobInfo)) =>
           sender() ! decorateMessage(
             ClassloadingProps(
-              libraryCacheManager.getBlobServerPort,
+              blobServer.getPort,
               graph.getRequiredJarFiles,
               graph.getRequiredClasspaths))
         case None =>
@@ -1014,7 +1041,7 @@ class JobManager(
       }
 
     case RequestBlobManagerPort =>
-      sender ! decorateMessage(libraryCacheManager.getBlobServerPort)
+      sender ! decorateMessage(blobServer.getPort)
 
     case RequestArchive =>
       sender ! decorateMessage(ResponseArchive(archive))
@@ -1026,13 +1053,13 @@ class JobManager(
         )
       )
 
-    case RequestTaskManagerInstance(instanceID) =>
+    case RequestTaskManagerInstance(resourceId) =>
       sender ! decorateMessage(
-        TaskManagerInstance(Option(instanceManager.getRegisteredInstanceById(instanceID)))
+        TaskManagerInstance(Option(instanceManager.getRegisteredInstance(resourceId)))
       )
 
     case Heartbeat(instanceID, accumulators) =>
-      log.debug(s"Received heartbeat message from $instanceID.")
+      log.trace(s"Received heartbeat message from $instanceID.")
 
       updateAccumulators(accumulators)
 
@@ -1052,9 +1079,18 @@ class JobManager(
 
       val originalSender = new AkkaActorGateway(sender(), leaderSessionID.orNull)
 
-      stackTraceFuture.thenAccept(new AcceptFunction[StackTrace] {
-        override def accept(value: StackTrace): Unit = {
-          originalSender.tell(value)
+      val sendingFuture = stackTraceFuture.thenAccept(
+        new Consumer[StackTrace]() {
+          override def accept(value: StackTrace): Unit = {
+            originalSender.tell(value)
+          }
+        })
+
+      sendingFuture.exceptionally(new java.util.function.Function[Throwable, Void] {
+        override def apply(value: Throwable): Void = {
+          log.info("Could not send requested stack trace.", value)
+
+          null
         }
       })
 
@@ -1062,7 +1098,7 @@ class JobManager(
       taskManagerMap.get(taskManagerActorRef) match {
         case Some(instanceId) => handleTaskManagerTerminated(taskManagerActorRef, instanceId)
         case None =>  log.debug("Received terminated message for task manager " +
-                                  s"${taskManagerActorRef} which is not " +
+                                  s"$taskManagerActorRef which is not " +
                                   "connected to this job manager.")
       }
 
@@ -1077,7 +1113,7 @@ class JobManager(
                 futuresToComplete = Some(futuresToComplete.getOrElse(Seq()) :+ futureToComplete)
               case None =>
             }
-        case None =>
+        case None => log.debug(s"Tried to remove nonexistent job $jobID.")
       }
 
     case RemoveCachedJob(jobID) =>
@@ -1133,7 +1169,7 @@ class JobManager(
           }
         case None =>
           // ResourceManager not available
-          // we choose not to wait here beacuse it might block the shutdown forever
+          // we choose not to wait here because it might block the shutdown forever
       }
 
       sender() ! decorateMessage(StopClusterSuccessful.getInstance())
@@ -1142,8 +1178,13 @@ class JobManager(
     case RequestLeaderSessionID =>
       sender() ! ResponseLeaderSessionID(leaderSessionID.orNull)
 
-    case RequestWebMonitorPort =>
-      sender() ! ResponseWebMonitorPort(webMonitorPort)
+    case RequestRestAddress =>
+      sender() !
+        decorateMessage(
+          optRestAddress.getOrElse(
+            Status.Failure(
+              new FlinkException("No REST endpoint has been started for the JobManager.")))
+        )
   }
 
   /**
@@ -1191,8 +1232,8 @@ class JobManager(
         // because this makes sure that the uploaded jar files are removed in case of
         // unsuccessful
         try {
-          libraryCacheManager.registerJob(jobGraph.getJobID, jobGraph.getUserJarBlobKeys,
-            jobGraph.getClasspaths)
+          libraryCacheManager.registerJob(
+            jobGraph.getJobID, jobGraph.getUserJarBlobKeys, jobGraph.getClasspaths)
         }
         catch {
           case t: Throwable =>
@@ -1210,27 +1251,19 @@ class JobManager(
           throw new JobSubmissionException(jobId, "The given job is empty")
         }
 
-        val restartStrategy =
-          Option(jobGraph.getSerializedExecutionConfig()
-            .deserializeValue(userCodeLoader)
-            .getRestartStrategy())
-            .map(RestartStrategyFactory.createRestartStrategy)
-            .filter(p => p != null) match {
-            case Some(strategy) => strategy
-            case None => restartStrategyFactory.createRestartStrategy()
-          }
+        val restartStrategyConfiguration = jobGraph
+          .getSerializedExecutionConfig
+          .deserializeValue(userCodeLoader)
+          .getRestartStrategy
+
+        val restartStrategy = RestartStrategyResolving
+          .resolve(restartStrategyConfiguration,
+            restartStrategyFactory,
+            jobGraph.isCheckpointingEnabled)
 
         log.info(s"Using restart strategy $restartStrategy for $jobId.")
 
-        val jobMetrics = jobManagerMetricGroup match {
-          case Some(group) =>
-            group.addJob(jobGraph) match {
-              case (jobGroup:Any) => jobGroup
-              case null => new UnregisteredMetricsGroup()
-            }
-          case None =>
-            new UnregisteredMetricsGroup()
-        }
+        val jobMetrics = jobManagerMetricGroup.addJob(jobGraph)
 
         val numSlots = scheduler.getTotalNumberOfSlots()
 
@@ -1244,18 +1277,24 @@ class JobManager(
             true
         }
 
+        val allocationTimeout: Long = flinkConfiguration.getLong(
+          JobManagerOptions.SLOT_REQUEST_TIMEOUT)
+
         executionGraph = ExecutionGraphBuilder.buildGraph(
           executionGraph,
           jobGraph,
           flinkConfiguration,
           futureExecutor,
           ioExecutor,
+          scheduler,
           userCodeLoader,
           checkpointRecoveryFactory,
           Time.of(timeout.length, timeout.unit),
           restartStrategy,
           jobMetrics,
           numSlots,
+          blobServer,
+          Time.milliseconds(allocationTimeout),
           log.logger)
         
         if (registerNewGraph) {
@@ -1280,10 +1319,11 @@ class JobManager(
           log.error(s"Failed to submit job $jobId ($jobName)", t)
 
           libraryCacheManager.unregisterJob(jobId)
+          blobServer.cleanupJob(jobId, true)
           currentJobs.remove(jobId)
 
           if (executionGraph != null) {
-            executionGraph.fail(t)
+            executionGraph.failGlobal(t)
           }
 
           val rt: Throwable = if (t.isInstanceOf[JobExecutionException]) {
@@ -1314,23 +1354,12 @@ class JobManager(
                 val savepointPath = savepointSettings.getRestorePath()
                 val allowNonRestored = savepointSettings.allowNonRestoredState()
 
-                log.info(s"Starting job from savepoint '$savepointPath'" +
-                  (if (allowNonRestored) " (allowing non restored state)" else "") + ".")
-
-                // load the savepoint as a checkpoint into the system
-                val savepoint: CompletedCheckpoint = SavepointLoader.loadAndValidateSavepoint(
-                  jobId, executionGraph.getAllVertices, savepointPath, allowNonRestored)
-
-                executionGraph.getCheckpointCoordinator.getCheckpointStore
-                  .addCheckpoint(savepoint)
-
-                // Reset the checkpoint ID counter
-                val nextCheckpointId: Long = savepoint.getCheckpointID + 1
-                log.info(s"Reset the checkpoint ID to $nextCheckpointId")
-                executionGraph.getCheckpointCoordinator.getCheckpointIdCounter
-                  .setCount(nextCheckpointId)
-
-                executionGraph.restoreLatestCheckpointedState(true, allowNonRestored)
+                executionGraph.getCheckpointCoordinator.restoreSavepoint(
+                  savepointPath, 
+                  allowNonRestored,
+                  executionGraph.getAllVertices,
+                  executionGraph.getUserClassLoader
+                )
               } catch {
                 case e: Exception =>
                   jobInfo.notifyClients(
@@ -1354,7 +1383,8 @@ class JobManager(
           jobInfo.notifyClients(
             decorateMessage(JobSubmitSuccess(jobGraph.getJobID)))
 
-          if (leaderElectionService.hasLeadership) {
+          if (leaderSessionID.isDefined &&
+            leaderElectionService.hasLeadership(leaderSessionID.get)) {
             // There is a small chance that multiple job managers schedule the same job after if
             // they try to recover at the same time. This will eventually be noticed, but can not be
             // ruled out from the beginning.
@@ -1364,7 +1394,7 @@ class JobManager(
             // the job.
             log.info(s"Scheduling job $jobId ($jobName).")
 
-            executionGraph.scheduleForExecution(scheduler)
+            executionGraph.scheduleForExecution()
           } else {
             // Remove the job graph. Otherwise it will be lingering around and possibly removed from
             // ZooKeeper by this JM.
@@ -1375,7 +1405,7 @@ class JobManager(
           }
         } catch {
           case t: Throwable => try {
-            executionGraph.fail(t)
+            executionGraph.failGlobal(t)
           } catch {
             case tt: Throwable =>
               log.error("Error while marking ExecutionGraph as failed.", tt)
@@ -1481,7 +1511,7 @@ class JobManager(
             }
 
           case None =>
-            sender() ! Status.Failure(new IllegalStateException(s"Job ${msg.getJobId} not found"))
+            sender() ! Status.Failure(new FlinkJobNotFoundException(msg.getJobId))
         }
 
       // TaskManager KvState registration
@@ -1605,8 +1635,8 @@ class JobManager(
           val future = (archive ? RequestJobsWithIDsOverview.getInstance())(timeout)
 
           future.onSuccess {
-            case archiveOverview: JobsWithIDsOverview =>
-              theSender ! new JobsWithIDsOverview(ourJobs, archiveOverview)
+            case archiveOverview: JobIdsWithStatusOverview =>
+              theSender ! new JobIdsWithStatusOverview(ourJobs, archiveOverview)
           }(context.dispatcher)
 
         case _ : RequestStatusOverview =>
@@ -1621,16 +1651,16 @@ class JobManager(
           val future = (archive ? RequestJobsOverview.getInstance())(timeout)
           future.onSuccess {
             case archiveOverview: JobsOverview =>
-              theSender ! new StatusOverview(numTMs, numSlotsTotal, numSlotsAvailable,
+              theSender ! new ClusterOverview(numTMs, numSlotsTotal, numSlotsAvailable,
                 ourJobs, archiveOverview)
           }(context.dispatcher)
 
         case msg : RequestJobDetails => 
           
-          val ourDetails: Array[JobDetails] = if (msg.shouldIncludeRunning()) {
+          val ourDetails: List[JobDetails] = if (msg.shouldIncludeRunning()) {
             currentJobs.values.map {
               v => WebMonitorUtils.createDetailsForJob(v._1)
-            }.toArray[JobDetails]
+            }.toList
           } else {
             null
           }
@@ -1639,10 +1669,11 @@ class JobManager(
             val future = (archive ? msg)(timeout)
             future.onSuccess {
               case archiveDetails: MultipleJobsDetails =>
-                theSender ! new MultipleJobsDetails(ourDetails, archiveDetails.getFinishedJobs())
+                theSender ! new MultipleJobsDetails(
+                  (ourDetails ++ archiveDetails.getJobs.asScala).asJavaCollection)
             }(context.dispatcher)
           } else {
-            theSender ! new MultipleJobsDetails(ourDetails, null)
+            theSender ! new MultipleJobsDetails(util.Arrays.asList(ourDetails: _*))
           }
           
         case _ => log.error("Unrecognized info message " + actorMessage)
@@ -1671,22 +1702,16 @@ class JobManager(
     new JobsOverview(runningOrPending, finished, canceled, failed)
   }
 
-  private def createJobStatusWithIDsOverview() : JobsWithIDsOverview = {
-    val runningOrPending = new java.util.ArrayList[JobID]()
-    val finished = new java.util.ArrayList[JobID]()
-    val canceled = new java.util.ArrayList[JobID]()
-    val failed = new java.util.ArrayList[JobID]()
-    
-    currentJobs.values.foreach { case (graph, _) =>
-      graph.getState() match {
-        case JobStatus.FINISHED => finished.add(graph.getJobID)
-        case JobStatus.CANCELED => canceled.add(graph.getJobID)
-        case JobStatus.FAILED => failed.add(graph.getJobID)
-        case _ => runningOrPending.add(graph.getJobID)
-      }
+  private def createJobStatusWithIDsOverview() : JobIdsWithStatusOverview = {
+    val jobIdsWithStatuses =
+      new java.util.ArrayList[JobIdWithStatus](currentJobs.size)
+
+    currentJobs.values.foreach { job =>
+      jobIdsWithStatuses.add(
+        new JobIdWithStatus(job._1.getJobID, job._1.getState))
     }
 
-    new JobsWithIDsOverview(runningOrPending, finished, canceled, failed)
+    new JobIdsWithStatusOverview(jobIdsWithStatuses)
   }
 
   /**
@@ -1701,44 +1726,48 @@ class JobManager(
    */
   private def removeJob(jobID: JobID, removeJobFromStateBackend: Boolean): Option[Future[Unit]] = {
     // Don't remove the job yet...
-    val futureOption = currentJobs.get(jobID) match {
+    val futureOption = currentJobs.remove(jobID) match {
       case Some((eg, _)) =>
-        val result = if (removeJobFromStateBackend) {
-          val futureOption = Some(future {
-            try {
+        val cleanUpFuture: Future[Unit] = Future {
+          val cleanupHABlobs = try {
+            if (removeJobFromStateBackend) {
               // ...otherwise, we can have lingering resources when there is a  concurrent shutdown
               // and the ZooKeeper client is closed. Not removing the job immediately allow the
               // shutdown to release all resources.
               submittedJobGraphs.removeJobGraph(jobID)
-            } catch {
-              case t: Throwable => log.error(s"Could not remove submitted job graph $jobID.", t)
+              true
+            } else {
+              submittedJobGraphs.releaseJobGraph(jobID)
+              false
             }
-          }(context.dispatcher))
-
-          try {
-            archive ! decorateMessage(ArchiveExecutionGraph(jobID, eg.archive()))
           } catch {
-            case t: Throwable => log.error(s"Could not archive the execution graph $eg.", t)
+            case t: Throwable => {
+              log.warn(s"Could not remove submitted job graph $jobID.", t)
+              false
+            }
           }
 
-          futureOption
-        } else {
-          None
+          blobServer.cleanupJob(jobID, cleanupHABlobs)
+          ()
+        }(context.dispatcher)
+
+        if (removeJobFromStateBackend) {
+          try {
+            archive ! decorateMessage(
+              ArchiveExecutionGraph(
+                jobID,
+                ArchivedExecutionGraph.createFrom(eg)))
+          } catch {
+            case t: Throwable => log.warn(s"Could not archive the execution graph $eg.", t)
+          }
         }
 
-        currentJobs.remove(jobID)
-
-        result
+        Option(cleanUpFuture)
       case None => None
     }
 
-    try {
-      libraryCacheManager.unregisterJob(jobID)
-    } catch {
-      case t: Throwable =>
-        log.error(s"Could not properly unregister job $jobID form the library cache.", t)
-    }
-    jobManagerMetricGroup.map(_.removeJob(jobID))
+    libraryCacheManager.unregisterJob(jobID)
+    jobManagerMetricGroup.removeJob(jobID)
 
     futureOption
   }
@@ -1750,18 +1779,23 @@ class JobManager(
     */
   private def cancelAndClearEverything(cause: Throwable)
     : Seq[Future[Unit]] = {
-    val futures = for ((jobID, (eg, jobInfo)) <- currentJobs) yield {
-      future {
-        eg.suspend(cause)
+
+    val futures = currentJobs.values.flatMap(
+      egJobInfo => {
+        val executionGraph = egJobInfo._1
+        val jobInfo = egJobInfo._2
+
+        executionGraph.suspend(cause)
+
+        val jobId = executionGraph.getJobID
 
         jobInfo.notifyNonDetachedClients(
           decorateMessage(
             Failure(
-              new JobExecutionException(jobID, "All jobs are cancelled and cleared.", cause))))
-      }(context.dispatcher)
-    }
+              new JobExecutionException(jobId, "All jobs are cancelled and cleared.", cause))))
 
-    currentJobs.clear()
+        removeJob(jobId, false)
+      })
 
     futures.toSeq
   }
@@ -1786,7 +1820,7 @@ class JobManager(
         job =>
           future {
             // Fail the execution graph
-            job._1.fail(new IllegalStateException("Another JobManager removed the job from " +
+            job._1.failGlobal(new IllegalStateException("Another JobManager removed the job from " +
               "ZooKeeper."))
           }(context.dispatcher)
       )
@@ -1813,18 +1847,19 @@ class JobManager(
    *
    * @param accumulators list of accumulator snapshots
    */
-  private def updateAccumulators(accumulators : Seq[AccumulatorSnapshot]) = {
-    accumulators foreach {
-      case accumulatorEvent =>
-        currentJobs.get(accumulatorEvent.getJobID) match {
-          case Some((jobGraph, jobInfo)) =>
-            future {
-              jobGraph.updateAccumulators(accumulatorEvent)
-            }(context.dispatcher)
-          case None =>
-          // ignore accumulator values for old job
+  private def updateAccumulators(accumulators : Seq[AccumulatorSnapshot]): Unit = {
+    accumulators.foreach( snapshot => {
+        if (snapshot != null) {
+          currentJobs.get(snapshot.getJobID) match {
+            case Some((jobGraph, jobInfo)) =>
+              future {
+                jobGraph.updateAccumulators(snapshot)
+              }(context.dispatcher)
+            case None =>
+              // ignore accumulator values for old job
+          }
         }
-    }
+    })
   }
 
   /**
@@ -1838,7 +1873,10 @@ class JobManager(
       FiniteDuration(10, SECONDS)).start()
 
     // Shutdown and discard all queued messages
-    context.system.shutdown()
+    context.system.terminate().onComplete {
+      case scala.util.Success(_) =>
+      case scala.util.Failure(t) => log.warn("Could not cleanly shut down actor system", t)
+    }(directExecutionContext())
   }
 
   private def instantiateMetrics(jobManagerMetricGroup: MetricGroup) : Unit = {
@@ -1855,7 +1893,6 @@ class JobManager(
     jobManagerMetricGroup.gauge[Long, Gauge[Long]]("numRunningJobs", new Gauge[Long] {
       override def getValue: Long = JobManager.this.currentJobs.size
     })
-    MetricUtils.instantiateStatusMetrics(jobManagerMetricGroup)
   }
 }
 
@@ -1870,12 +1907,6 @@ object JobManager {
 
   val STARTUP_FAILURE_RETURN_CODE = 1
   val RUNTIME_FAILURE_RETURN_CODE = 2
-
-  /** Name of the JobManager actor */
-  val JOB_MANAGER_NAME = "jobmanager"
-
-  /** Name of the archive actor */
-  val ARCHIVE_NAME = "archive"
 
 
   /**
@@ -1892,14 +1923,15 @@ object JobManager {
     // parsing the command line arguments
     val (configuration: Configuration,
          executionMode: JobManagerMode,
-         listeningHost: String,
-         listeningPortRange: java.util.Iterator[Integer]) =
+         externalHostName: String,
+         portRange: java.util.Iterator[Integer]) =
     try {
       parseArgs(args)
     }
     catch {
       case t: Throwable =>
         LOG.error(t.getMessage(), t)
+        t.printStackTrace()
         System.exit(STARTUP_FAILURE_RETURN_CODE)
         null
     }
@@ -1907,14 +1939,14 @@ object JobManager {
     // we want to check that the JobManager hostname is in the config
     // if it is not in there, the actor system will bind to the loopback interface's
     // address and will not be reachable from anyone remote
-    if (listeningHost == null) {
-      val message = "Config parameter '" + ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY +
+    if (externalHostName == null) {
+      val message = "Config parameter '" + JobManagerOptions.ADDRESS.key() +
         "' is missing (hostname/address to bind JobManager to)."
       LOG.error(message)
       System.exit(STARTUP_FAILURE_RETURN_CODE)
     }
 
-    if (!listeningPortRange.hasNext) {
+    if (!portRange.hasNext) {
       if (ZooKeeperUtils.isZooKeeperRecoveryMode(configuration)) {
         val message = "Config parameter '" + ConfigConstants.HA_JOB_MANAGER_PORT +
           "' does not specify a valid port range."
@@ -1922,7 +1954,7 @@ object JobManager {
         System.exit(STARTUP_FAILURE_RETURN_CODE)
       }
       else {
-        val message = s"Config parameter '" + ConfigConstants.JOB_MANAGER_IPC_PORT_KEY +
+        val message = s"Config parameter '" + JobManagerOptions.ADDRESS.key() +
           "' does not specify a valid port."
         LOG.error(message)
         System.exit(STARTUP_FAILURE_RETURN_CODE)
@@ -1930,21 +1962,22 @@ object JobManager {
     }
 
     // run the job manager
-    SecurityContext.install(new SecurityConfiguration().setFlinkConfiguration(configuration))
+    SecurityUtils.install(new SecurityConfiguration(configuration))
 
     try {
-      SecurityContext.getInstalled.runSecured(new FlinkSecuredRunner[Unit] {
-        override def run(): Unit = {
+      SecurityUtils.getInstalledContext.runSecured(new Callable[Unit] {
+        override def call(): Unit = {
           runJobManager(
             configuration,
             executionMode,
-            listeningHost,
-            listeningPortRange)
+            externalHostName,
+            portRange)
         }
       })
     } catch {
       case t: Throwable =>
         LOG.error("Failed to run JobManager.", t)
+        t.printStackTrace()
         System.exit(STARTUP_FAILURE_RETURN_CODE)
     }
   }
@@ -1972,24 +2005,43 @@ object JobManager {
 
     val numberProcessors = Hardware.getNumberCPUCores()
 
-    val futureExecutor = Executors.newFixedThreadPool(
+    val futureExecutor = Executors.newScheduledThreadPool(
       numberProcessors,
-      new NamedThreadFactory("jobmanager-future-", "-thread-"))
+      new ExecutorThreadFactory("jobmanager-future"))
 
     val ioExecutor = Executors.newFixedThreadPool(
       numberProcessors,
-      new NamedThreadFactory("jobmanager-io-", "-thread-"))
+      new ExecutorThreadFactory("jobmanager-io"))
 
     val timeout = AkkaUtils.getTimeout(configuration)
 
-    val (jobManagerSystem, _, _, webMonitorOption, _) = try {
-      startActorSystemAndJobManagerActors(
+    // we have to first start the JobManager ActorSystem because this determines the port if 0
+    // was chosen before. The method startActorSystem will update the configuration correspondingly.
+    val jobManagerSystem = startActorSystem(
+      configuration,
+      listeningAddress,
+      listeningPort)
+
+    val highAvailabilityServices = HighAvailabilityServicesUtils.createHighAvailabilityServices(
+      configuration,
+      ioExecutor,
+      AddressResolution.NO_ADDRESS_RESOLUTION)
+
+    val metricRegistry = new MetricRegistryImpl(
+      MetricRegistryConfiguration.fromConfiguration(configuration))
+
+    metricRegistry.startQueryService(jobManagerSystem, null)
+
+    val (_, _, webMonitorOption, _) = try {
+      startJobManagerActors(
+        jobManagerSystem,
         configuration,
         executionMode,
         listeningAddress,
-        listeningPort,
         futureExecutor,
         ioExecutor,
+        highAvailabilityServices,
+        metricRegistry,
         classOf[JobManager],
         classOf[MemoryArchivist],
         Option(classOf[StandaloneResourceManager])
@@ -2003,7 +2055,7 @@ object JobManager {
     }
 
     // block until everything is shut down
-    jobManagerSystem.awaitTermination()
+    Await.ready(jobManagerSystem.whenTerminated, Duration.Inf)
 
     webMonitorOption.foreach{
       webMonitor =>
@@ -2015,7 +2067,21 @@ object JobManager {
         }
     }
 
-    FlinkExecutors.gracefulShutdown(
+    try {
+      highAvailabilityServices.close()
+    } catch {
+      case t: Throwable =>
+        LOG.warn("Could not properly stop the high availability services.", t)
+    }
+
+    try {
+      metricRegistry.shutdown().get()
+    } catch {
+      case t: Throwable =>
+        LOG.warn("Could not properly shut down the metric registry.", t)
+    }
+
+    ExecutorUtils.gracefulShutdown(
       timeout.toMillis,
       TimeUnit.MILLISECONDS,
       futureExecutor,
@@ -2039,7 +2105,7 @@ object JobManager {
       listeningPortRange: java.util.Iterator[Integer])
     : Unit = {
 
-    val result = retryOnBindException({
+    val result = AkkaUtils.retryOnBindException({
       // Try all ports in the range until successful
       val socket = NetUtils.createSocketFromPorts(
         listeningPortRange,
@@ -2047,7 +2113,7 @@ object JobManager {
           override def createSocket(port: Int): ServerSocket = new ServerSocket(
             // Use the correct listening address, bound ports will only be
             // detected later by Akka.
-            port, 0, InetAddress.getByName(listeningAddress))
+            port, 0, InetAddress.getByName(NetUtils.getWildcardIPAddress))
         })
 
       val port =
@@ -2071,128 +2137,76 @@ object JobManager {
   }
 
   /**
-    * Retries a function if it fails because of a [[java.net.BindException]].
+    * Starts the JobManager actor system.
     *
-    * @param fn The function to retry
-    * @param stopCond Flag to signal termination
-    * @param maxSleepBetweenRetries Max random sleep time between retries
-    * @tparam T Return type of the the function to retry
-    * @return Return value of the the function to retry
+    * @param configuration Configuration to use for the job manager actor system
+    * @param externalHostname External hostname to bind to
+    * @param port Port to bind to
+    * @return Actor system for the JobManager and its components
     */
-  @tailrec
-  def retryOnBindException[T](
-      fn: => T,
-      stopCond: => Boolean,
-      maxSleepBetweenRetries : Long = 0 )
-    : scala.util.Try[T] = {
+  def startActorSystem(
+      configuration: Configuration,
+      externalHostname: String,
+      port: Int): ActorSystem = {
+    // Bring up the job manager actor system first, bind it to the given address.
+    val jobManagerSystem = BootstrapTools.startActorSystem(
+      configuration,
+      externalHostname,
+      port,
+      LOG.logger)
 
-    def sleepBeforeRetry() : Unit = {
-      if (maxSleepBetweenRetries > 0) {
-        val sleepTime = (Math.random() * maxSleepBetweenRetries).asInstanceOf[Long]
-        LOG.info(s"Retrying after bind exception. Sleeping for ${sleepTime} ms.")
-        Thread.sleep(sleepTime)
-      }
-    }
+    val address = AkkaUtils.getAddress(jobManagerSystem)
 
-    scala.util.Try {
-      fn
-    } match {
-      case scala.util.Failure(x: BindException) =>
-        if (stopCond) {
-          scala.util.Failure(new RuntimeException(
-            "Unable to do further retries starting the actor system"))
-        } else {
-          sleepBeforeRetry()
-          retryOnBindException(fn, stopCond)
-        }
-      case scala.util.Failure(x: Exception) => x.getCause match {
-        case c: ChannelException =>
-          if (stopCond) {
-            scala.util.Failure(new RuntimeException(
-              "Unable to do further retries starting the actor system"))
-          } else {
-            sleepBeforeRetry()
-            retryOnBindException(fn, stopCond)
-          }
-        case _ => scala.util.Failure(x)
-      }
-      case f => f
-    }
+    configuration.setString(JobManagerOptions.ADDRESS, address.host.get)
+    configuration.setInteger(JobManagerOptions.PORT, address.port.get)
+
+    jobManagerSystem
   }
 
-  /** Starts an ActorSystem, the JobManager and all its components including the WebMonitor.
+  /** Starts the JobManager and all its components including the WebMonitor.
     *
     * @param configuration The configuration object for the JobManager
     * @param executionMode The execution mode in which to run. Execution mode LOCAL with spawn an
     *                      additional TaskManager in the same process.
-    * @param listeningAddress The hostname where the JobManager should listen for messages.
-    * @param listeningPort The port where the JobManager should listen for messages
+    * @param externalHostname The hostname where the JobManager is reachable for rpc communication
     * @param futureExecutor to run the JobManager's futures
     * @param ioExecutor to run blocking io operations
+    * @param highAvailabilityServices to instantiate high availability services
     * @param jobManagerClass The class of the JobManager to be started
     * @param archiveClass The class of the Archivist to be started
     * @param resourceManagerClass Optional class of resource manager if one should be started
     * @return A tuple containing the started ActorSystem, ActorRefs to the JobManager and the
     *         Archivist and an Option containing a possibly started WebMonitor
     */
-  def startActorSystemAndJobManagerActors(
+  def startJobManagerActors(
+      jobManagerSystem: ActorSystem,
       configuration: Configuration,
       executionMode: JobManagerMode,
-      listeningAddress: String,
-      listeningPort: Int,
-      futureExecutor: Executor,
+      externalHostname: String,
+      futureExecutor: ScheduledExecutorService,
       ioExecutor: Executor,
+      highAvailabilityServices: HighAvailabilityServices,
+      metricRegistry: FlinkMetricRegistry,
       jobManagerClass: Class[_ <: JobManager],
       archiveClass: Class[_ <: MemoryArchivist],
       resourceManagerClass: Option[Class[_ <: FlinkResourceManager[_]]])
-    : (ActorSystem, ActorRef, ActorRef, Option[WebMonitor], Option[ActorRef]) = {
-
-    LOG.info("Starting JobManager")
-
-    // Bring up the job manager actor system first, bind it to the given address.
-    val hostPortUrl = NetUtils.hostAndPortToUrlString(listeningAddress, listeningPort)
-    LOG.info(s"Starting JobManager actor system at $hostPortUrl")
-
-    val jobManagerSystem = try {
-      val akkaConfig = AkkaUtils.getAkkaConfig(
-        configuration,
-        Some((listeningAddress, listeningPort))
-      )
-      if (LOG.isDebugEnabled) {
-        LOG.debug("Using akka configuration\n " + akkaConfig)
-      }
-      AkkaUtils.createActorSystem(akkaConfig)
-    }
-    catch {
-      case t: Throwable =>
-        if (t.isInstanceOf[org.jboss.netty.channel.ChannelException]) {
-          val cause = t.getCause()
-          if (cause != null && t.getCause().isInstanceOf[java.net.BindException]) {
-            val address = listeningAddress + ":" + listeningPort
-            throw new Exception("Unable to create JobManager at address " + address +
-              " - " + cause.getMessage(), t)
-          }
-        }
-        throw new Exception("Could not create JobManager actor system", t)
-    }
-
-    val address = AkkaUtils.getAddress(jobManagerSystem)
-
-    configuration.setString(ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY, address.host.get)
-    configuration.setInteger(ConfigConstants.JOB_MANAGER_IPC_PORT_KEY, address.port.get)
+    : (ActorRef, ActorRef, Option[WebMonitor], Option[ActorRef]) = {
 
     val webMonitor: Option[WebMonitor] =
-      if (configuration.getInteger(ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, 0) >= 0) {
+      if (configuration.getInteger(WebOptions.PORT, 0) >= 0) {
         LOG.info("Starting JobManager web frontend")
-        val leaderRetrievalService = LeaderRetrievalUtils
-          .createLeaderRetrievalService(configuration)
+
+        val timeout = FutureUtils.toTime(AkkaUtils.getTimeout(configuration))
 
         // start the web frontend. we need to load this dynamically
         // because it is not in the same project/dependencies
         val webServer = WebMonitorUtils.startWebRuntimeMonitor(
           configuration,
-          leaderRetrievalService,
-          jobManagerSystem)
+          highAvailabilityServices,
+          new AkkaJobManagerRetriever(jobManagerSystem, timeout, 10, Time.milliseconds(50L)),
+          new AkkaQueryServiceRetriever(jobManagerSystem, timeout),
+          timeout,
+          new ScheduledExecutorServiceAdapter(futureExecutor))
 
         Option(webServer)
       }
@@ -2202,7 +2216,7 @@ object JobManager {
 
     // Reset the port (necessary in case of automatic port selection)
     webMonitor.foreach{ monitor => configuration.setInteger(
-      ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, monitor.getServerPort) }
+      WebOptions.PORT, monitor.getServerPort) }
 
     try {
       // bring up the job manager actor
@@ -2212,6 +2226,9 @@ object JobManager {
         jobManagerSystem,
         futureExecutor,
         ioExecutor,
+        highAvailabilityServices,
+        metricRegistry,
+        webMonitor.map(_.getRestAddress),
         jobManagerClass,
         archiveClass)
 
@@ -2230,13 +2247,16 @@ object JobManager {
       if (executionMode == JobManagerMode.LOCAL) {
         LOG.info("Starting embedded TaskManager for JobManager's LOCAL execution mode")
 
+        val resourceId = ResourceID.generate()
+
         val taskManagerActor = TaskManager.startTaskManagerComponentsAndActor(
           configuration,
-          ResourceID.generate(),
+          resourceId,
           jobManagerSystem,
-          listeningAddress,
-          Some(TaskManager.TASK_MANAGER_NAME),
-          None,
+          highAvailabilityServices,
+          metricRegistry,
+          externalHostname,
+          Some(TaskExecutor.TASK_MANAGER_NAME),
           localTaskManagerCommunication = true,
           classOf[TaskManager])
 
@@ -2252,9 +2272,7 @@ object JobManager {
 
       // start web monitor
       webMonitor.foreach {
-        monitor =>
-          val jobManagerAkkaUrl = JobManager.getRemoteJobManagerAkkaURL(configuration)
-          monitor.start(jobManagerAkkaUrl)
+        _.start()
       }
 
       val resourceManager =
@@ -2265,23 +2283,23 @@ object JobManager {
               FlinkResourceManager.startResourceManagerActors(
                 configuration,
                 jobManagerSystem,
-                LeaderRetrievalUtils.createLeaderRetrievalService(configuration),
+                highAvailabilityServices.getJobManagerLeaderRetriever(
+                  HighAvailabilityServices.DEFAULT_JOB_ID),
                 rmClass))
           case None =>
             LOG.info("Resource Manager class not provided. No resource manager will be started.")
             None
         }
 
-      (jobManagerSystem, jobManager, archive, webMonitor, resourceManager)
+      (jobManager, archive, webMonitor, resourceManager)
     }
     catch {
       case t: Throwable =>
         LOG.error("Error while starting up JobManager", t)
-        try {
-          jobManagerSystem.shutdown()
-        } catch {
-          case tt: Throwable => LOG.warn("Could not cleanly shut down actor system", tt)
-        }
+        jobManagerSystem.terminate().onComplete {
+          case scala.util.Success(_) =>
+          case scala.util.Failure(tt) => LOG.warn("Could not cleanly shut down actor system", tt)
+        }(directExecutionContext())
         throw t
     }
   }
@@ -2327,17 +2345,17 @@ object JobManager {
       }
     }
 
-    val config = parser.parse(args, new JobManagerCliOptions()).getOrElse {
+    val cliOptions = parser.parse(args, new JobManagerCliOptions()).getOrElse {
       throw new Exception(
         s"Invalid command line arguments: ${args.mkString(" ")}. Usage: ${parser.usage}")
     }
     
-    val configDir = config.getConfigDir()
+    val configDir = cliOptions.getConfigDir()
     
     if (configDir == null) {
       throw new Exception("Missing parameter '--configDir'")
     }
-    if (config.getJobManagerMode() == null) {
+    if (cliOptions.getJobManagerMode() == null) {
       throw new Exception("Missing parameter '--executionMode'")
     }
 
@@ -2345,7 +2363,7 @@ object JobManager {
     val configuration = GlobalConfiguration.loadConfiguration(configDir)
 
     try {
-      FileSystem.setDefaultScheme(configuration)
+      FileSystem.initialize(configuration)
     }
     catch {
       case e: IOException => {
@@ -2354,26 +2372,22 @@ object JobManager {
       }
     }
 
-    if (new File(configDir).isDirectory) {
-      configuration.setString(ConfigConstants.FLINK_BASE_DIR_PATH_KEY, configDir + "/..")
+    if (cliOptions.getWebUIPort() >= 0) {
+      configuration.setInteger(WebOptions.PORT, cliOptions.getWebUIPort())
     }
 
-    if (config.getWebUIPort() >= 0) {
-      configuration.setInteger(ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, config.getWebUIPort())
+    if (cliOptions.getHost() != null) {
+      configuration.setString(JobManagerOptions.ADDRESS, cliOptions.getHost())
     }
 
-    if (config.getHost() != null) {
-      configuration.setString(ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY, config.getHost())
-    }
-
-    val host = configuration.getString(ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY, null)
+    val host = configuration.getString(JobManagerOptions.ADDRESS)
 
     val portRange =
       // high availability mode
       if (ZooKeeperUtils.isZooKeeperRecoveryMode(configuration)) {
         LOG.info("Starting JobManager with high-availability")
 
-        configuration.setInteger(ConfigConstants.JOB_MANAGER_IPC_PORT_KEY, 0)
+        configuration.setInteger(JobManagerOptions.PORT, 0)
 
         // The port range of allowed job manager ports or 0 for random
         configuration.getValue(HighAvailabilityOptions.HA_JOB_MANAGER_PORT_RANGE)
@@ -2382,12 +2396,10 @@ object JobManager {
         LOG.info("Starting JobManager without high-availability")
 
         // In standalone mode, we don't allow port ranges
-        val listeningPort = configuration.getInteger(
-          ConfigConstants.JOB_MANAGER_IPC_PORT_KEY,
-          ConfigConstants.DEFAULT_JOB_MANAGER_IPC_PORT)
+        val listeningPort = configuration.getInteger(JobManagerOptions.PORT)
 
         if (listeningPort <= 0 || listeningPort >= 65536) {
-          val message = "Config parameter '" + ConfigConstants.JOB_MANAGER_IPC_PORT_KEY +
+          val message = "Config parameter '" + JobManagerOptions.PORT.key() +
             "' is invalid, it must be greater than 0 and less than 65536."
           LOG.error(message)
           System.exit(STARTUP_FAILURE_RETURN_CODE)
@@ -2396,10 +2408,9 @@ object JobManager {
         String.valueOf(listeningPort)
       }
 
-    val executionMode = config.getJobManagerMode
-    val hostUrl = NetUtils.ipAddressToUrlString(InetAddress.getByName(host))
+    val executionMode = cliOptions.getJobManagerMode
 
-    LOG.info(s"Starting JobManager on $hostUrl:$portRange with execution mode $executionMode")
+    LOG.info(s"Starting JobManager on $host:$portRange with execution mode $executionMode")
 
     val portRangeIterator = NetUtils.getPortRangeFromString(portRange)
 
@@ -2414,39 +2425,53 @@ object JobManager {
    * @param configuration The configuration from which to parse the config values.
    * @param futureExecutor to run JobManager's futures
    * @param ioExecutor to run blocking io operations
-   * @param leaderElectionServiceOption LeaderElectionService which shall be returned if the option
-   *                                    is defined
+   * @param blobStore to store blobs persistently
    * @return The members for a default JobManager.
    */
   def createJobManagerComponents(
       configuration: Configuration,
-      futureExecutor: Executor,
+      futureExecutor: ScheduledExecutorService,
       ioExecutor: Executor,
-      leaderElectionServiceOption: Option[LeaderElectionService]) :
+      blobStore: BlobStore,
+      metricRegistry: FlinkMetricRegistry) :
     (InstanceManager,
     FlinkScheduler,
+    BlobServer,
     BlobLibraryCacheManager,
     RestartStrategyFactory,
     FiniteDuration, // timeout
     Int, // number of archived jobs
-    LeaderElectionService,
-    SubmittedJobGraphStore,
-    CheckpointRecoveryFactory,
+    Option[Path], // archive path
     FiniteDuration, // timeout for job recovery
-    Option[FlinkMetricRegistry]
+    JobManagerMetricGroup
    ) = {
 
     val timeout: FiniteDuration = AkkaUtils.getTimeout(configuration)
 
-    val cleanupInterval = configuration.getLong(
-      ConfigConstants.LIBRARY_CACHE_MANAGER_CLEANUP_INTERVAL,
-      ConfigConstants.DEFAULT_LIBRARY_CACHE_MANAGER_CLEANUP_INTERVAL) * 1000
+    val classLoaderResolveOrder = configuration.getString(CoreOptions.CLASSLOADER_RESOLVE_ORDER)
+
+    val alwaysParentFirstLoaderPatterns = CoreOptions.getParentFirstLoaderPatterns(configuration)
 
     val restartStrategy = RestartStrategyFactory.createRestartStrategyFactory(configuration)
 
-    val archiveCount = configuration.getInteger(ConfigConstants.JOB_MANAGER_WEB_ARCHIVE_COUNT,
-      ConfigConstants.DEFAULT_JOB_MANAGER_WEB_ARCHIVE_COUNT)
+    val archiveCount = configuration.getInteger(WebOptions.ARCHIVE_COUNT)
 
+    val archiveDir = configuration.getString(JobManagerOptions.ARCHIVE_DIR)
+
+    val archivePath = if (archiveDir != null) {
+      try {
+        Option.apply(
+          WebMonitorUtils.validateAndNormalizeUri(new Path(archiveDir).toUri))
+      } catch {
+        case e: Exception =>
+          LOG.warn(s"Failed to validate specified archive directory in '$archiveDir'. " +
+            "Jobs will not be archived for the HistoryServer.", e)
+          Option.empty
+      }
+    } else {
+      LOG.debug("No archive directory was configured. Jobs will not be archived.")
+      Option.empty
+    }
 
     var blobServer: BlobServer = null
     var instanceManager: InstanceManager = null
@@ -2454,56 +2479,35 @@ object JobManager {
     var libraryCacheManager: BlobLibraryCacheManager = null
 
     try {
-      blobServer = new BlobServer(configuration)
+      blobServer = new BlobServer(configuration, blobStore)
+      blobServer.start()
       instanceManager = new InstanceManager()
       scheduler = new FlinkScheduler(ExecutionContext.fromExecutor(futureExecutor))
-      libraryCacheManager = new BlobLibraryCacheManager(blobServer, cleanupInterval)
+      libraryCacheManager =
+        new BlobLibraryCacheManager(
+          blobServer,
+          ResolveOrder.fromString(classLoaderResolveOrder),
+          alwaysParentFirstLoaderPatterns)
 
       instanceManager.addInstanceListener(scheduler)
     }
     catch {
       case t: Throwable =>
-        if (libraryCacheManager != null) {
-          libraryCacheManager.shutdown()
-        }
         if (scheduler != null) {
           scheduler.shutdown()
         }
         if (instanceManager != null) {
           instanceManager.shutdown()
         }
+        if (libraryCacheManager != null) {
+          libraryCacheManager.shutdown()
+        }
         if (blobServer != null) {
-          blobServer.shutdown()
+          blobServer.close()
         }
         
         throw t
     }
-
-    // Create recovery related components
-    val (leaderElectionService, submittedJobGraphs, checkpointRecoveryFactory) =
-      HighAvailabilityMode.fromConfig(configuration) match {
-        case HighAvailabilityMode.NONE =>
-          val leaderElectionService = leaderElectionServiceOption match {
-            case Some(les) => les
-            case None => new StandaloneLeaderElectionService()
-          }
-
-          (leaderElectionService,
-            new StandaloneSubmittedJobGraphStore(),
-            new StandaloneCheckpointRecoveryFactory())
-
-        case HighAvailabilityMode.ZOOKEEPER =>
-          val client = ZooKeeperUtils.startCuratorFramework(configuration)
-
-          val leaderElectionService = leaderElectionServiceOption match {
-            case Some(les) => les
-            case None => ZooKeeperUtils.createLeaderElectionService(client, configuration)
-          }
-
-          (leaderElectionService,
-            ZooKeeperUtils.createSubmittedJobGraphs(client, configuration, ioExecutor),
-            new ZooKeeperCheckpointRecoveryFactory(client, configuration, ioExecutor))
-      }
 
     val jobRecoveryTimeoutStr = configuration.getValue(HighAvailabilityOptions.HA_JOB_DELAY)
 
@@ -2520,24 +2524,21 @@ object JobManager {
       }
     }
 
-    val metricRegistry = try {
-      Option(new FlinkMetricRegistry(MetricRegistryConfiguration.fromConfiguration(configuration)))
-    } catch {
-      case _: Exception =>
-        None
-    }
+    val jobManagerMetricGroup = MetricUtils.instantiateJobManagerMetricGroup(
+      metricRegistry,
+      configuration.getString(JobManagerOptions.ADDRESS),
+      ConfigurationUtils.getSystemResourceMetricsProbingInterval(configuration))
 
     (instanceManager,
       scheduler,
+      blobServer,
       libraryCacheManager,
       restartStrategy,
       timeout,
       archiveCount,
-      leaderElectionService,
-      submittedJobGraphs,
-      checkpointRecoveryFactory,
+      archivePath,
       jobRecoveryTimeout,
-      metricRegistry)
+      jobManagerMetricGroup)
   }
 
   /**
@@ -2548,6 +2549,8 @@ object JobManager {
    * @param actorSystem The actor system running the JobManager
    * @param futureExecutor to run JobManager's futures
    * @param ioExecutor to run blocking io operations
+   * @param highAvailabilityServices high availability services
+   * @param optRestAddress optional rest address
    * @param jobManagerClass The class of the JobManager to be started
    * @param archiveClass The class of the MemoryArchivist to be started
    * @return A tuple of references (JobManager Ref, Archiver Ref)
@@ -2555,8 +2558,11 @@ object JobManager {
   def startJobManagerActors(
       configuration: Configuration,
       actorSystem: ActorSystem,
-      futureExecutor: Executor,
+      futureExecutor: ScheduledExecutorService,
       ioExecutor: Executor,
+      highAvailabilityServices: HighAvailabilityServices,
+      metricRegistry: FlinkMetricRegistry,
+      optRestAddress: Option[String],
       jobManagerClass: Class[_ <: JobManager],
       archiveClass: Class[_ <: MemoryArchivist])
     : (ActorRef, ActorRef) = {
@@ -2566,8 +2572,11 @@ object JobManager {
       actorSystem,
       futureExecutor,
       ioExecutor,
-      Some(JOB_MANAGER_NAME),
-      Some(ARCHIVE_NAME),
+      highAvailabilityServices,
+      metricRegistry,
+      optRestAddress,
+      Some(JobMaster.JOB_MANAGER_NAME),
+      Some(JobMaster.ARCHIVE_NAME),
       jobManagerClass,
       archiveClass)
   }
@@ -2580,6 +2589,8 @@ object JobManager {
    * @param actorSystem The actor system running the JobManager
    * @param futureExecutor to run JobManager's futures
    * @param ioExecutor to run blocking io operations
+   * @param highAvailabilityServices high availability services
+   * @param optRestAddress optional rest address
    * @param jobManagerActorName Optionally the name of the JobManager actor. If none is given,
    *                          the actor will have the name generated by the actor system.
    * @param archiveActorName Optionally the name of the archive actor. If none is given,
@@ -2591,8 +2602,11 @@ object JobManager {
   def startJobManagerActors(
       configuration: Configuration,
       actorSystem: ActorSystem,
-      futureExecutor: Executor,
+      futureExecutor: ScheduledExecutorService,
       ioExecutor: Executor,
+      highAvailabilityServices: HighAvailabilityServices,
+      metricRegistry: FlinkMetricRegistry,
+      optRestAddress: Option[String],
       jobManagerActorName: Option[String],
       archiveActorName: Option[String],
       jobManagerClass: Class[_ <: JobManager],
@@ -2601,21 +2615,21 @@ object JobManager {
 
     val (instanceManager,
     scheduler,
+    blobServer,
     libraryCacheManager,
     restartStrategy,
     timeout,
     archiveCount,
-    leaderElectionService,
-    submittedJobGraphs,
-    checkpointRecoveryFactory,
+    archivePath,
     jobRecoveryTimeout,
-    metricsRegistry) = createJobManagerComponents(
+    jobManagerMetricGroup) = createJobManagerComponents(
       configuration,
       futureExecutor,
       ioExecutor,
-      None)
+      highAvailabilityServices.createBlobStore(),
+      metricRegistry)
 
-    val archiveProps = getArchiveProps(archiveClass, archiveCount)
+    val archiveProps = getArchiveProps(archiveClass, archiveCount, archivePath)
 
     // start the archiver with the given name, or without (avoid name conflicts)
     val archive: ActorRef = archiveActorName match {
@@ -2630,42 +2644,43 @@ object JobManager {
       ioExecutor,
       instanceManager,
       scheduler,
+      blobServer,
       libraryCacheManager,
       archive,
       restartStrategy,
       timeout,
-      leaderElectionService,
-      submittedJobGraphs,
-      checkpointRecoveryFactory,
+      highAvailabilityServices.getJobManagerLeaderElectionService(
+        HighAvailabilityServices.DEFAULT_JOB_ID),
+      highAvailabilityServices.getSubmittedJobGraphStore(),
+      highAvailabilityServices.getCheckpointRecoveryFactory(),
       jobRecoveryTimeout,
-      metricsRegistry)
+      jobManagerMetricGroup,
+      optRestAddress)
 
     val jobManager: ActorRef = jobManagerActorName match {
       case Some(actorName) => actorSystem.actorOf(jobManagerProps, actorName)
       case None => actorSystem.actorOf(jobManagerProps)
     }
 
-    metricsRegistry match {
-      case Some(registry) =>
-        registry.startQueryService(actorSystem, null)
-      case None =>
-    }
-
     (jobManager, archive)
   }
 
-  def getArchiveProps(archiveClass: Class[_ <: MemoryArchivist], archiveCount: Int): Props = {
-    Props(archiveClass, archiveCount)
+  def getArchiveProps(
+      archiveClass: Class[_ <: MemoryArchivist],
+      archiveCount: Int,
+      archivePath: Option[Path]): Props = {
+    Props(archiveClass, archiveCount, archivePath)
   }
 
   def getJobManagerProps(
     jobManagerClass: Class[_ <: JobManager],
     configuration: Configuration,
-    futureExecutor: Executor,
+    futureExecutor: ScheduledExecutorService,
     ioExecutor: Executor,
     instanceManager: InstanceManager,
     scheduler: FlinkScheduler,
-    libraryCacheManager: BlobLibraryCacheManager,
+    blobServer: BlobServer,
+    libraryCacheManager: LibraryCacheManager,
     archive: ActorRef,
     restartStrategyFactory: RestartStrategyFactory,
     timeout: FiniteDuration,
@@ -2673,7 +2688,8 @@ object JobManager {
     submittedJobGraphStore: SubmittedJobGraphStore,
     checkpointRecoveryFactory: CheckpointRecoveryFactory,
     jobRecoveryTimeout: FiniteDuration,
-    metricsRegistry: Option[FlinkMetricRegistry]): Props = {
+    jobManagerMetricGroup: JobManagerMetricGroup,
+    optRestAddress: Option[String]): Props = {
 
     Props(
       jobManagerClass,
@@ -2682,6 +2698,7 @@ object JobManager {
       ioExecutor,
       instanceManager,
       scheduler,
+      blobServer,
       libraryCacheManager,
       archive,
       restartStrategyFactory,
@@ -2690,144 +2707,7 @@ object JobManager {
       submittedJobGraphStore,
       checkpointRecoveryFactory,
       jobRecoveryTimeout,
-      metricsRegistry)
-  }
-
-  // --------------------------------------------------------------------------
-  //  Resolving the JobManager endpoint
-  // --------------------------------------------------------------------------
-
-  /**
-   * Builds the akka actor path for the JobManager actor, given the socket address
-   * where the JobManager's actor system runs.
-   *
-   * @param protocol The protocol to be used to connect to the remote JobManager's actor system.
-   * @param address The address of the JobManager's actor system.
-   * @return The akka URL of the JobManager actor.
-   */
-  def getRemoteJobManagerAkkaURL(
-      protocol: String,
-      address: InetSocketAddress,
-      name: Option[String] = None)
-    : String = {
-
-    require(protocol == "akka.tcp" || protocol == "akka.ssl.tcp",
-        "protocol field should be either akka.tcp or akka.ssl.tcp")
-
-    val hostPort = NetUtils.socketAddressToUrlString(address)
-
-    getJobManagerAkkaURLHelper(s"$protocol://flink@$hostPort", name)
-  }
-
-  /**
-   * Returns the JobManager actor's remote Akka URL, given the configured hostname and port.
-   *
-   * @param config The configuration to parse
-   * @return JobManager actor remote Akka URL
-   */
-  def getRemoteJobManagerAkkaURL(config: Configuration) : String = {
-    val (protocol, hostname, port) = TaskManager.getAndCheckJobManagerAddress(config)
-
-    var hostPort: InetSocketAddress = null
-
-    try {
-      val inetAddress: InetAddress = InetAddress.getByName(hostname)
-      hostPort = new InetSocketAddress(inetAddress, port)
-    }
-    catch {
-      case e: UnknownHostException =>
-        throw new UnknownHostException(s"Cannot resolve the JobManager hostname '$hostname' " +
-          s"specified in the configuration")
-    }
-
-    JobManager.getRemoteJobManagerAkkaURL(protocol, hostPort, Option.empty)
-  }
-
-  /**
-   * Builds the akka actor path for the JobManager actor to address the actor within
-   * its own actor system.
-   *
-   * @return The local akka URL of the JobManager actor.
-   */
-  def getLocalJobManagerAkkaURL(name: Option[String] = None): String = {
-    getJobManagerAkkaURLHelper("akka://flink", name)
-  }
-
-  def getJobManagerAkkaURL(system: ActorSystem, name: Option[String] = None): String = {
-    getJobManagerAkkaURLHelper(AkkaUtils.getAddress(system).toString, name)
-  }
-
-  private def getJobManagerAkkaURLHelper(address: String, name: Option[String]): String = {
-    address + "/user/" + name.getOrElse(JOB_MANAGER_NAME)
-  }
-
-  def getJobManagerActorRefFuture(
-      protocol: String,
-      address: InetSocketAddress,
-      system: ActorSystem,
-      timeout: FiniteDuration)
-    : Future[ActorRef] = {
-    AkkaUtils.getActorRefFuture(getRemoteJobManagerAkkaURL(protocol, address), system, timeout)
-  }
-
-  /**
-   * Resolves the JobManager actor reference in a blocking fashion.
-   *
-   * @param jobManagerUrl The akka URL of the JobManager.
-   * @param system The local actor system that should perform the lookup.
-   * @param timeout The maximum time to wait until the lookup fails.
-   * @throws java.io.IOException Thrown, if the lookup fails.
-   * @return The ActorRef to the JobManager
-   */
-  @throws(classOf[IOException])
-  def getJobManagerActorRef(
-      jobManagerUrl: String,
-      system: ActorSystem,
-      timeout: FiniteDuration)
-    : ActorRef = {
-    AkkaUtils.getActorRef(jobManagerUrl, system, timeout)
-  }
-
-  /**
-   * Resolves the JobManager actor reference in a blocking fashion.
-   *
-   * @param protocol The protocol to be used to connect to the remote JobManager's actor system.
-   * @param address The socket address of the JobManager's actor system.
-   * @param system The local actor system that should perform the lookup.
-   * @param timeout The maximum time to wait until the lookup fails.
-   * @throws java.io.IOException Thrown, if the lookup fails.
-   * @return The ActorRef to the JobManager
-   */
-  @throws(classOf[IOException])
-  def getJobManagerActorRef(
-      protocol: String,
-      address: InetSocketAddress,
-      system: ActorSystem,
-      timeout: FiniteDuration)
-    : ActorRef = {
-
-    val jmAddress = getRemoteJobManagerAkkaURL(protocol, address)
-    getJobManagerActorRef(jmAddress, system, timeout)
-  }
-
-  /**
-   * Resolves the JobManager actor reference in a blocking fashion.
-   *
-   * @param address The socket address of the JobManager's actor system.
-   * @param system The local actor system that should perform the lookup.
-   * @param config The config describing the maximum time to wait until the lookup fails.
-   * @throws java.io.IOException Thrown, if the lookup fails.
-   * @return The ActorRef to the JobManager
-   */
-  @throws(classOf[IOException])
-  def getJobManagerActorRef(
-      address: InetSocketAddress,
-      system: ActorSystem,
-      config: Configuration)
-    : ActorRef = {
-
-    val timeout = AkkaUtils.getLookupTimeout(config)
-    val protocol = AkkaUtils.getAkkaProtocol(config)
-    getJobManagerActorRef(protocol, address, system, timeout)
+      jobManagerMetricGroup,
+      optRestAddress)
   }
 }

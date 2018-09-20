@@ -15,21 +15,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.runtime.metrics.groups;
 
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.executiongraph.IOMetrics;
-import org.apache.flink.runtime.operators.testutils.UnregisteredTaskMetricsGroup;
+
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 
+/**
+ * Tests for the {@link TaskIOMetricGroup}.
+ */
 public class TaskIOMetricGroupTest {
 	@Test
 	public void testTaskIOMetricGroup() {
-		TaskMetricGroup task = new UnregisteredTaskMetricsGroup();
+		TaskMetricGroup task = UnregisteredMetricGroups.createUnregisteredTaskMetricGroup();
 		TaskIOMetricGroup taskIO = task.getIOMetricGroup();
 
 		// test counter forwarding
@@ -50,12 +54,18 @@ public class TaskIOMetricGroupTest {
 		taskIO.getNumBytesInLocalCounter().inc(100L);
 		taskIO.getNumBytesInRemoteCounter().inc(150L);
 		taskIO.getNumBytesOutCounter().inc(250L);
-		
+		taskIO.getNumBuffersInLocalCounter().inc(1L);
+		taskIO.getNumBuffersInRemoteCounter().inc(2L);
+		taskIO.getNumBuffersOutCounter().inc(3L);
+
 		IOMetrics io = taskIO.createSnapshot();
 		assertEquals(32L, io.getNumRecordsIn());
 		assertEquals(64L, io.getNumRecordsOut());
 		assertEquals(100L, io.getNumBytesInLocal());
 		assertEquals(150L, io.getNumBytesInRemote());
 		assertEquals(250L, io.getNumBytesOut());
+		assertEquals(1L, taskIO.getNumBuffersInLocalCounter().getCount());
+		assertEquals(2L, taskIO.getNumBuffersInRemoteCounter().getCount());
+		assertEquals(3L, taskIO.getNumBuffersOutCounter().getCount());
 	}
 }

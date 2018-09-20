@@ -28,18 +28,25 @@ import org.apache.flink.core.io.InputSplit;
 import org.apache.flink.core.io.InputSplitAssigner;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
+import org.apache.flink.runtime.execution.Environment;
+import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.InputSplitProvider;
 import org.apache.flink.runtime.memory.MemoryManager;
 import org.apache.flink.runtime.operators.testutils.MockEnvironment;
+import org.apache.flink.runtime.operators.testutils.MockEnvironmentBuilder;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.api.watermark.Watermark;
+
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
 import java.util.Collections;
 
+/**
+ * Tests for {@link InputFormatSourceFunction}.
+ */
 public class InputFormatSourceFunctionTest {
 
 	@Test
@@ -59,30 +66,37 @@ public class InputFormatSourceFunctionTest {
 
 		final LifeCycleTestInputFormat format = new LifeCycleTestInputFormat();
 		final InputFormatSourceFunction<Integer> reader = new InputFormatSourceFunction<>(format, TypeInformation.of(Integer.class));
-		reader.setRuntimeContext(new MockRuntimeContext(format, noOfSplits));
 
-		Assert.assertTrue(!format.isConfigured);
-		Assert.assertTrue(!format.isInputFormatOpen);
-		Assert.assertTrue(!format.isSplitOpen);
+		try (MockEnvironment environment =
+				new MockEnvironmentBuilder()
+					.setTaskName("no")
+					.setMemorySize(4 * MemoryManager.DEFAULT_PAGE_SIZE)
+					.build()) {
 
-		reader.open(new Configuration());
-		Assert.assertTrue(format.isConfigured);
+			reader.setRuntimeContext(new MockRuntimeContext(format, noOfSplits, environment));
 
-		TestSourceContext ctx = new TestSourceContext(reader, format, midCancel, cancelAt);
-		reader.run(ctx);
+			Assert.assertTrue(!format.isConfigured);
+			Assert.assertTrue(!format.isInputFormatOpen);
+			Assert.assertTrue(!format.isSplitOpen);
 
-		int splitsSeen = ctx.getSplitsSeen();
-		Assert.assertTrue(midCancel ? splitsSeen == cancelAt : splitsSeen == noOfSplits);
+			reader.open(new Configuration());
+			Assert.assertTrue(format.isConfigured);
 
-		// we have exhausted the splits so the
-		// format and splits should be closed by now
+			TestSourceContext ctx = new TestSourceContext(reader, format, midCancel, cancelAt);
+			reader.run(ctx);
 
-		Assert.assertTrue(!format.isSplitOpen);
-		Assert.assertTrue(!format.isInputFormatOpen);
+			int splitsSeen = ctx.getSplitsSeen();
+			Assert.assertTrue(midCancel ? splitsSeen == cancelAt : splitsSeen == noOfSplits);
+
+			// we have exhausted the splits so the
+			// format and splits should be closed by now
+
+			Assert.assertTrue(!format.isSplitOpen);
+			Assert.assertTrue(!format.isInputFormatOpen);
+		}
 	}
 
-
-	private static class LifeCycleTestInputFormat extends RichInputFormat<Integer,InputSplit> {
+	private static class LifeCycleTestInputFormat extends RichInputFormat<Integer, InputSplit> {
 
 		private static final long serialVersionUID = 7408902249499583273L;
 		private boolean isConfigured = false;
@@ -225,6 +239,11 @@ public class InputFormatSourceFunctionTest {
 		}
 
 		@Override
+		public void markAsTemporarilyIdle() {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
 		public Object getCheckpointLock() {
 			return null;
 		}
@@ -247,10 +266,9 @@ public class InputFormatSourceFunctionTest {
 		private final LifeCycleTestInputFormat format;
 		private InputSplit[] inputSplits;
 
-		private MockRuntimeContext(LifeCycleTestInputFormat format, int noOfSplits) {
-
+		private MockRuntimeContext(LifeCycleTestInputFormat format, int noOfSplits, Environment environment) {
 			super(new MockStreamOperator(),
-				new MockEnvironment("no", 4 * MemoryManager.DEFAULT_PAGE_SIZE, null, 16),
+				environment,
 				Collections.<String, Accumulator<?, ?>>emptyMap());
 
 			this.noOfSplits = noOfSplits;
@@ -290,6 +308,11 @@ public class InputFormatSourceFunctionTest {
 			@Override
 			public ExecutionConfig getExecutionConfig() {
 				return new ExecutionConfig();
+			}
+
+			@Override
+			public OperatorID getOperatorID() {
+				return new OperatorID();
 			}
 		}
 	}

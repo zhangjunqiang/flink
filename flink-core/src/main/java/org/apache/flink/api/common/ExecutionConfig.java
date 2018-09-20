@@ -18,11 +18,15 @@
 
 package org.apache.flink.api.common;
 
-import com.esotericsoftware.kryo.Serializer;
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.Public;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.configuration.MetricOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.util.Preconditions;
+
+import com.esotericsoftware.kryo.Serializer;
 
 import java.io.Serializable;
 import java.util.Collections;
@@ -67,6 +71,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	 * The constant to use for the parallelism, if the system should use the number
 	 * of currently available slots.
 	 */
+	@Deprecated
 	public static final int PARALLELISM_AUTO_MAX = Integer.MAX_VALUE;
 
 	/**
@@ -108,6 +113,9 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 
 	private boolean forceKryo = false;
 
+	/** Flag to indicate whether generic types (through Kryo) are supported */
+	private boolean disableGenericTypes = false;
+
 	private boolean objectReuse = false;
 
 	private boolean autoTypeRegistrationEnabled = true;
@@ -124,7 +132,9 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	/**
 	 * Interval in milliseconds for sending latency tracking marks from the sources to the sinks.
 	 */
-	private long latencyTrackingInterval = 2000L;
+	private long latencyTrackingInterval = MetricOptions.LATENCY_INTERVAL.defaultValue();
+
+	private boolean isLatencyTrackingConfigured = false;
 
 	/**
 	 * @deprecated Should no longer be used because it is subsumed by RestartStrategyConfiguration
@@ -132,7 +142,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	@Deprecated
 	private long executionRetryDelay = DEFAULT_RESTART_DELAY;
 
-	private RestartStrategies.RestartStrategyConfiguration restartStrategyConfiguration;
+	private RestartStrategies.RestartStrategyConfiguration restartStrategyConfiguration =
+		new RestartStrategies.FallbackRestartStrategyConfiguration();
 	
 	private long taskCancellationIntervalMillis = -1;
 
@@ -141,6 +152,12 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	 * TaskManager error, usually killing the JVM.
 	 */
 	private long taskCancellationTimeoutMillis = -1;
+
+	/** This flag defines if we use compression for the state snapshot data or not. Default: false */
+	private boolean useSnapshotCompression = false;
+
+	/** Determines if a task fails or not if there is an error in writing its checkpoint data. Default: true */
+	private boolean failTaskOnCheckpointError = true;
 
 	// ------------------------------- User code values --------------------------------------------
 
@@ -194,7 +211,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	}
 
 	/**
-	 * Sets the interval of the automatic watermark emission. Watermaks are used throughout
+	 * Sets the interval of the automatic watermark emission. Watermarks are used throughout
 	 * the streaming system to keep track of the progress of time. They are used, for example,
 	 * for time based windowing.
 	 *
@@ -220,8 +237,6 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	 * Interval for sending latency tracking marks from the sources to the sinks.
 	 * Flink will send latency tracking marks from the sources at the specified interval.
 	 *
-	 * Recommended value: 2000 (2 seconds).
-	 *
 	 * Setting a tracking interval <= 0 disables the latency tracking.
 	 *
 	 * @param interval Interval in milliseconds.
@@ -229,6 +244,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	@PublicEvolving
 	public ExecutionConfig setLatencyTrackingInterval(long interval) {
 		this.latencyTrackingInterval = interval;
+		this.isLatencyTrackingConfigured = true;
 		return this;
 	}
 
@@ -242,12 +258,17 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	}
 
 	/**
-	 * Returns if latency tracking is enabled
-	 * @return True, if the tracking is enabled, false otherwise.
+	 * @deprecated will be removed in a future version
 	 */
 	@PublicEvolving
+	@Deprecated
 	public boolean isLatencyTrackingEnabled() {
-		return latencyTrackingInterval > 0;
+		return isLatencyTrackingConfigured && latencyTrackingInterval > 0;
+	}
+
+	@Internal
+	public boolean isLatencyTrackingConfigured() {
+		return isLatencyTrackingConfigured;
 	}
 
 	/**
@@ -378,7 +399,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	 */
 	@PublicEvolving
 	public void setRestartStrategy(RestartStrategies.RestartStrategyConfiguration restartStrategyConfiguration) {
-		this.restartStrategyConfiguration = restartStrategyConfiguration;
+		this.restartStrategyConfiguration = Preconditions.checkNotNull(restartStrategyConfiguration);
 	}
 
 	/**
@@ -389,14 +410,14 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	@PublicEvolving
 	@SuppressWarnings("deprecation")
 	public RestartStrategies.RestartStrategyConfiguration getRestartStrategy() {
-		if (restartStrategyConfiguration == null) {
+		if (restartStrategyConfiguration instanceof RestartStrategies.FallbackRestartStrategyConfiguration) {
 			// support the old API calls by creating a restart strategy from them
 			if (getNumberOfExecutionRetries() > 0 && getExecutionRetryDelay() >= 0) {
 				return RestartStrategies.fixedDelayRestart(getNumberOfExecutionRetries(), getExecutionRetryDelay());
 			} else if (getNumberOfExecutionRetries() == 0) {
 				return RestartStrategies.noRestart();
 			} else {
-				return null;
+				return restartStrategyConfiguration;
 			}
 		} else {
 			return restartStrategyConfiguration;
@@ -518,16 +539,69 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	}
 
 	/**
-	 * Force Flink to use the AvroSerializer for POJOs.
+	 * Enables the use generic types which are serialized via Kryo.
+	 * 
+	 * <p>Generic types are enabled by default.
+	 *
+	 * @see #disableGenericTypes()
+	 */
+	public void enableGenericTypes() {
+		disableGenericTypes = false;
+	}
+
+	/**
+	 * Disables the use of generic types (types that would be serialized via Kryo). If this option
+	 * is used, Flink will throw an {@code UnsupportedOperationException} whenever it encounters
+	 * a data type that would go through Kryo for serialization.
+	 *
+	 * <p>Disabling generic types can be helpful to eagerly find and eliminate teh use of types
+	 * that would go through Kryo serialization during runtime. Rather than checking types
+	 * individually, using this option will throw exceptions eagerly in the places where generic
+	 * types are used.
+	 * 
+	 * <p><b>Important:</b> We recommend to use this option only during development and pre-production
+	 * phases, not during actual production use. The application program and/or the input data may be
+	 * such that new, previously unseen, types occur at some point. In that case, setting this option
+	 * would cause the program to fail.
+	 * 
+	 * @see #enableGenericTypes()
+	 */
+	public void disableGenericTypes() {
+		disableGenericTypes = true;
+	}
+
+	/**
+	 * Checks whether generic types are supported. Generic types are types that go through Kryo during
+	 * serialization.
+	 * 
+	 * <p>Generic types are enabled by default.
+	 * 
+	 * @see #enableGenericTypes()
+	 * @see #disableGenericTypes()
+	 */
+	public boolean hasGenericTypesDisabled() {
+		return disableGenericTypes;
+	}
+
+	/**
+	 * Forces Flink to use the Apache Avro serializer for POJOs.
+	 *
+	 * <b>Important:</b> Make sure to include the <i>flink-avro</i> module.
 	 */
 	public void enableForceAvro() {
 		forceAvro = true;
 	}
 
+	/**
+	 * Disables the Apache Avro serializer as the forced serializer for POJOs.
+	 */
 	public void disableForceAvro() {
 		forceAvro = false;
 	}
 
+	/**
+	 * Returns whether the Apache Avro is the default serializer for POJOs.
+	 */
 	public boolean isForceAvroEnabled() {
 		return forceAvro;
 	}
@@ -791,6 +865,34 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 		this.autoTypeRegistrationEnabled = false;
 	}
 
+	public boolean isUseSnapshotCompression() {
+		return useSnapshotCompression;
+	}
+
+	public void setUseSnapshotCompression(boolean useSnapshotCompression) {
+		this.useSnapshotCompression = useSnapshotCompression;
+	}
+
+	/**
+	 * This method is visible because of the way the configuration is currently forwarded from the checkpoint config to
+	 * the task. This should not be called by the user, please use CheckpointConfig.isFailTaskOnCheckpointError()
+	 * instead.
+	 */
+	@Internal
+	public boolean isFailTaskOnCheckpointError() {
+		return failTaskOnCheckpointError;
+	}
+
+	/**
+	 * This method is visible because of the way the configuration is currently forwarded from the checkpoint config to
+	 * the task. This should not be called by the user, please use CheckpointConfig.setFailOnCheckpointingErrors(...)
+	 * instead.
+	 */
+	@Internal
+	public void setFailTaskOnCheckpointError(boolean failTaskOnCheckpointError) {
+		this.failTaskOnCheckpointError = failTaskOnCheckpointError;
+	}
+
 	@Override
 	public boolean equals(Object obj) {
 		if (obj instanceof ExecutionConfig) {
@@ -803,6 +905,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 				((restartStrategyConfiguration == null && other.restartStrategyConfiguration == null) ||
 					(null != restartStrategyConfiguration && restartStrategyConfiguration.equals(other.restartStrategyConfiguration))) &&
 				forceKryo == other.forceKryo &&
+				disableGenericTypes == other.disableGenericTypes &&
 				objectReuse == other.objectReuse &&
 				autoTypeRegistrationEnabled == other.autoTypeRegistrationEnabled &&
 				forceAvro == other.forceAvro &&
@@ -814,7 +917,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 				defaultKryoSerializerClasses.equals(other.defaultKryoSerializerClasses) &&
 				registeredKryoTypes.equals(other.registeredKryoTypes) &&
 				registeredPojoTypes.equals(other.registeredPojoTypes) &&
-				taskCancellationIntervalMillis == other.taskCancellationIntervalMillis;
+				taskCancellationIntervalMillis == other.taskCancellationIntervalMillis &&
+				useSnapshotCompression == other.useSnapshotCompression;
 
 		} else {
 			return false;
@@ -829,6 +933,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 			parallelism,
 			restartStrategyConfiguration,
 			forceKryo,
+			disableGenericTypes,
 			objectReuse,
 			autoTypeRegistrationEnabled,
 			forceAvro,
@@ -840,7 +945,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 			defaultKryoSerializerClasses,
 			registeredKryoTypes,
 			registeredPojoTypes,
-			taskCancellationIntervalMillis);
+			taskCancellationIntervalMillis,
+			useSnapshotCompression);
 	}
 
 	public boolean canEqual(Object obj) {
@@ -848,6 +954,7 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	}
 	
 	@Override
+	@Internal
 	public ArchivedExecutionConfig archive() {
 		return new ArchivedExecutionConfig(this);
 	}

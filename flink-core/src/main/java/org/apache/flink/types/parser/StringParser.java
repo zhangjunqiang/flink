@@ -42,6 +42,12 @@ public class StringParser extends FieldParser<String> {
 	@Override
 	public int parseField(byte[] bytes, int startPos, int limit, byte[] delimiter, String reusable) {
 
+		if (startPos == limit) {
+			setErrorState(ParseErrorState.EMPTY_COLUMN);
+			this.result = "";
+			return limit;
+		}
+
 		int i = startPos;
 
 		final int delimLimit = limit - delimiter.length + 1;
@@ -63,11 +69,11 @@ public class StringParser extends FieldParser<String> {
 				// check for proper termination
 				if (i == limit) {
 					// either by end of line
-					this.result = new String(bytes, startPos + 1, i - startPos - 2);
+					this.result = new String(bytes, startPos + 1, i - startPos - 2, getCharset());
 					return limit;
 				} else if ( i < delimLimit && delimiterNext(bytes, i, delimiter)) {
 					// or following field delimiter
-					this.result = new String(bytes, startPos + 1, i - startPos - 2);
+					this.result = new String(bytes, startPos + 1, i - startPos - 2, getCharset());
 					return i + delimiter.length;
 				} else {
 					// no proper termination
@@ -83,18 +89,14 @@ public class StringParser extends FieldParser<String> {
 			}
 
 			if (i >= delimLimit) {
-				// no delimiter found. Take the full string
-				if (limit == startPos) {
-					setErrorState(ParseErrorState.EMPTY_COLUMN); // mark empty column
-				}
-				this.result = new String(bytes, startPos, limit - startPos);
+				this.result = new String(bytes, startPos, limit - startPos, getCharset());
 				return limit;
 			} else {
 				// delimiter found.
 				if (i == startPos) {
 					setErrorState(ParseErrorState.EMPTY_COLUMN); // mark empty column
 				}
-				this.result = new String(bytes, startPos, i - startPos);
+				this.result = new String(bytes, startPos, i - startPos, getCharset());
 				return i + delimiter.length;
 			}
 		}

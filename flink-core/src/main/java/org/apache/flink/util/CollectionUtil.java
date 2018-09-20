@@ -18,10 +18,21 @@
 
 package org.apache.flink.util;
 
+import org.apache.flink.annotation.Internal;
+
 import java.util.Collection;
 import java.util.Map;
 
+/**
+ * Simple utility to work with Java collections.
+ */
+@Internal
 public final class CollectionUtil {
+
+	/**
+	 * A safe maximum size for arrays in the JVM.
+	 */
+	public static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
 
 	private CollectionUtil() {
 		throw new AssertionError();

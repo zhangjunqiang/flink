@@ -24,6 +24,7 @@ import java.io.ObjectOutputStream;
 import java.lang.reflect.Field;
 import java.util.List;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeutils.CompositeTypeComparator;
 import org.apache.flink.api.common.typeutils.TypeComparator;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
@@ -33,7 +34,7 @@ import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.types.NullKeyFieldException;
 import org.apache.flink.util.InstantiationUtil;
 
-
+@Internal
 public final class PojoComparator<T> extends CompositeTypeComparator<T> implements java.io.Serializable {
 	
 	private static final long serialVersionUID = 1L;
@@ -85,7 +86,7 @@ public final class PojoComparator<T> extends CompositeTypeComparator<T> implemen
 					inverted = k.invertNormalizedKey();
 				}
 				else if (k.invertNormalizedKey() != inverted) {
-					// if a successor does not agree on the invertion direction, it cannot be part of the normalized key
+					// if a successor does not agree on the inversion direction, it cannot be part of the normalized key
 					break;
 				}
 
@@ -130,9 +131,7 @@ public final class PojoComparator<T> extends CompositeTypeComparator<T> implemen
 		try {
 			this.serializer = (TypeSerializer<T>) InstantiationUtil.deserializeObject(
 					InstantiationUtil.serializeObject(toClone.serializer), Thread.currentThread().getContextClassLoader());
-		} catch (IOException e) {
-			throw new RuntimeException("Cannot copy serializer", e);
-		} catch (ClassNotFoundException e) {
+		} catch (IOException | ClassNotFoundException e) {
 			throw new RuntimeException("Cannot copy serializer", e);
 		}
 	}
@@ -142,8 +141,7 @@ public final class PojoComparator<T> extends CompositeTypeComparator<T> implemen
 		out.defaultWriteObject();
 		out.writeInt(keyFields.length);
 		for (Field field: keyFields) {
-			out.writeObject(field.getDeclaringClass());
-			out.writeUTF(field.getName());
+			FieldSerializer.serializeField(field, out);
 		}
 	}
 
@@ -153,23 +151,7 @@ public final class PojoComparator<T> extends CompositeTypeComparator<T> implemen
 		int numKeyFields = in.readInt();
 		keyFields = new Field[numKeyFields];
 		for (int i = 0; i < numKeyFields; i++) {
-			Class<?> clazz = (Class<?>) in.readObject();
-			String fieldName = in.readUTF();
-			// try superclasses as well
-			while (clazz != null) {
-				try {
-					Field field = clazz.getDeclaredField(fieldName);
-					field.setAccessible(true);
-					keyFields[i] = field;
-					break;
-				} catch (NoSuchFieldException e) {
-					clazz = clazz.getSuperclass();
-				}
-			}
-			if (keyFields[i] == null ) {
-				throw new RuntimeException("Class resolved at TaskManager is not compatible with class read during Plan setup."
-						+ " (" + fieldName + ")");
-			}
+			keyFields[i] = FieldSerializer.deserializeField(in);
 		}
 	}
 
@@ -304,7 +286,7 @@ public final class PojoComparator<T> extends CompositeTypeComparator<T> implemen
 	@Override
 	public void putNormalizedKey(T value, MemorySegment target, int offset, int numBytes) {
 		int i = 0;
-		for (; i < this.numLeadingNormalizableKeys & numBytes > 0; i++)
+		for (; i < this.numLeadingNormalizableKeys && numBytes > 0; i++)
 		{
 			int len = this.normalizedKeyLengths[i];
 			len = numBytes >= len ? len : numBytes;

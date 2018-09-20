@@ -18,19 +18,32 @@
 
 package org.apache.flink.yarn;
 
-import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.security.SecurityContext;
+import org.apache.flink.configuration.SecurityOptions;
+import org.apache.flink.runtime.security.SecurityConfiguration;
+import org.apache.flink.runtime.security.SecurityUtils;
+import org.apache.flink.runtime.security.modules.HadoopModule;
 import org.apache.flink.test.util.SecureTestEnvironment;
 import org.apache.flink.test.util.TestingSecurityContext;
+
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo.FifoScheduler;
+import org.hamcrest.Matchers;
 import org.junit.AfterClass;
+import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.Collections;
+import java.util.concurrent.Callable;
+
+/**
+ * An extension of the {@link YARNSessionFIFOITCase} that runs the tests in a secured YARN cluster.
+ */
 public class YARNSessionFIFOSecuredITCase extends YARNSessionFIFOITCase {
 
 	protected static final Logger LOG = LoggerFactory.getLogger(YARNSessionFIFOSecuredITCase.class);
@@ -40,38 +53,43 @@ public class YARNSessionFIFOSecuredITCase extends YARNSessionFIFOITCase {
 
 		LOG.info("starting secure cluster environment for testing");
 
-		yarnConfiguration.setClass(YarnConfiguration.RM_SCHEDULER, FifoScheduler.class, ResourceScheduler.class);
-		yarnConfiguration.setInt(YarnConfiguration.NM_PMEM_MB, 768);
-		yarnConfiguration.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 512);
-		yarnConfiguration.set(YarnTestBase.TEST_CLUSTER_NAME_KEY, "flink-yarn-tests-fifo-secured");
+		YARN_CONFIGURATION.setClass(YarnConfiguration.RM_SCHEDULER, FifoScheduler.class, ResourceScheduler.class);
+		YARN_CONFIGURATION.setInt(YarnConfiguration.NM_PMEM_MB, 768);
+		YARN_CONFIGURATION.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 512);
+		YARN_CONFIGURATION.set(YarnTestBase.TEST_CLUSTER_NAME_KEY, "flink-yarn-tests-fifo-secured");
 
 		SecureTestEnvironment.prepare(tmp);
 
-		populateYarnSecureConfigurations(yarnConfiguration,SecureTestEnvironment.getHadoopServicePrincipal(),
+		populateYarnSecureConfigurations(YARN_CONFIGURATION, SecureTestEnvironment.getHadoopServicePrincipal(),
 				SecureTestEnvironment.getTestKeytab());
 
 		Configuration flinkConfig = new Configuration();
-		flinkConfig.setString(ConfigConstants.SECURITY_KEYTAB_KEY,
+		flinkConfig.setString(SecurityOptions.KERBEROS_LOGIN_KEYTAB,
 				SecureTestEnvironment.getTestKeytab());
-		flinkConfig.setString(ConfigConstants.SECURITY_PRINCIPAL_KEY,
+		flinkConfig.setString(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL,
 				SecureTestEnvironment.getHadoopServicePrincipal());
 
-		SecurityContext.SecurityConfiguration ctx = new SecurityContext.SecurityConfiguration();
-		ctx.setFlinkConfiguration(flinkConfig);
-		ctx.setHadoopConfiguration(yarnConfiguration);
-		try {
-			TestingSecurityContext.install(ctx, SecureTestEnvironment.getClientSecurityConfigurationMap());
+		SecurityConfiguration securityConfig =
+			new SecurityConfiguration(
+				flinkConfig,
+				Collections.singletonList(securityConfig1 -> {
+					// manually override the Hadoop Configuration
+					return new HadoopModule(securityConfig1, YARN_CONFIGURATION);
+				}));
 
-			SecurityContext.getInstalled().runSecured(new SecurityContext.FlinkSecuredRunner<Integer>() {
+		try {
+			TestingSecurityContext.install(securityConfig, SecureTestEnvironment.getClientSecurityConfigurationMap());
+
+			SecurityUtils.getInstalledContext().runSecured(new Callable<Object>() {
 				@Override
-				public Integer run() {
-					startYARNSecureMode(yarnConfiguration, SecureTestEnvironment.getHadoopServicePrincipal(),
+				public Integer call() {
+					startYARNSecureMode(YARN_CONFIGURATION, SecureTestEnvironment.getHadoopServicePrincipal(),
 							SecureTestEnvironment.getTestKeytab());
 					return null;
 				}
 			});
 
-		} catch(Exception e) {
+		} catch (Exception e) {
 			throw new RuntimeException("Exception occurred while setting up secure test context. Reason: {}", e);
 		}
 
@@ -81,6 +99,23 @@ public class YARNSessionFIFOSecuredITCase extends YARNSessionFIFOITCase {
 	public static void teardownSecureCluster() throws Exception {
 		LOG.info("tearing down secure cluster environment");
 		SecureTestEnvironment.cleanup();
+	}
+
+	@Test(timeout = 60000) // timeout after a minute.
+	@Override
+	public void testDetachedMode() throws InterruptedException, IOException {
+		super.testDetachedMode();
+		final String[] mustHave = {"Login successful for user", "using keytab file"};
+		final boolean jobManagerRunsWithKerberos = verifyStringsInNamedLogFiles(
+			mustHave,
+			"jobmanager.log");
+		final boolean taskManagerRunsWithKerberos = verifyStringsInNamedLogFiles(
+			mustHave, "taskmanager.log");
+
+		Assert.assertThat(
+			"The JobManager and the TaskManager should both run with Kerberos.",
+			jobManagerRunsWithKerberos && taskManagerRunsWithKerberos,
+			Matchers.is(true));
 	}
 
 	/* For secure cluster testing, it is enough to run only one test and override below test methods

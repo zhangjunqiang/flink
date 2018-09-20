@@ -21,6 +21,8 @@ package org.apache.flink.runtime.jobmanager;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 
+import javax.annotation.Nullable;
+
 import java.io.Serializable;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -44,9 +46,9 @@ public class SubmittedJobGraph implements Serializable {
 	 * @param jobGraph The submitted {@link JobGraph}
 	 * @param jobInfo  The {@link JobInfo}
 	 */
-	public SubmittedJobGraph(JobGraph jobGraph, JobInfo jobInfo) {
+	public SubmittedJobGraph(JobGraph jobGraph, @Nullable JobInfo jobInfo) {
 		this.jobGraph = checkNotNull(jobGraph, "Job graph");
-		this.jobInfo = checkNotNull(jobInfo, "Job info");
+		this.jobInfo = jobInfo;
 	}
 
 	/**
@@ -72,6 +74,6 @@ public class SubmittedJobGraph implements Serializable {
 
 	@Override
 	public String toString() {
-		return String.format("SubmittedJobGraph(%s, %s)", jobGraph, jobInfo);
+		return String.format("SubmittedJobGraph(%s, %s)", jobGraph.getJobID(), jobInfo);
 	}
 }

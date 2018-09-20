@@ -59,9 +59,9 @@ env.setNumberOfExecutionRetries(3)
 
 You can also define default values for the number of execution retries and the retry delay in the `flink-conf.yaml`:
 
-~~~
+{% highlight yaml %}
 execution-retries.default: 3
-~~~
+{% endhighlight %}
 
 
 Retry Delays
@@ -77,13 +77,13 @@ You can set the retry delay for each program as follows (the sample shows the Da
 <div class="codetabs" markdown="1">
 <div data-lang="java" markdown="1">
 {% highlight java %}
-StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
 env.getConfig().setExecutionRetryDelay(5000); // 5000 milliseconds delay
 {% endhighlight %}
 </div>
 <div data-lang="scala" markdown="1">
 {% highlight scala %}
-val env = StreamExecutionEnvironment.getExecutionEnvironment()
+val env = ExecutionEnvironment.getExecutionEnvironment()
 env.getConfig.setExecutionRetryDelay(5000) // 5000 milliseconds delay
 {% endhighlight %}
 </div>
@@ -91,8 +91,8 @@ env.getConfig.setExecutionRetryDelay(5000) // 5000 milliseconds delay
 
 You can also define the default value for the retry delay in the `flink-conf.yaml`:
 
-~~~
+{% highlight yaml %}
 execution-retries.delay: 10 s
-~~~
+{% endhighlight %}
 
 {% top %}

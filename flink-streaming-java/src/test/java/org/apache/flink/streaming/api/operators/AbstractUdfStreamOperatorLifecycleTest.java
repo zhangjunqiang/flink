@@ -23,7 +23,9 @@ import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
+import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.execution.ExecutionState;
+import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.runtime.taskmanager.Task;
@@ -32,9 +34,11 @@ import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.streamstatus.StreamStatusMaintainer;
 import org.apache.flink.streaming.runtime.tasks.SourceStreamTask;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 import org.apache.flink.streaming.runtime.tasks.StreamTaskTest;
+
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -60,6 +64,7 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 			"UDF::open",
 			"OPERATOR::run",
 			"UDF::run",
+			"OPERATOR::prepareSnapshotPreBarrier",
 			"OPERATOR::snapshotState",
 			"OPERATOR::close",
 			"UDF::close",
@@ -78,16 +83,23 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 			"OPERATOR::dispose",
 			"UDF::close");
 
-	private static final String ALL_METHODS_STREAM_OPERATOR = "[close[], dispose[], getChainingStrategy[], " +
-			"getMetricGroup[], initializeState[class org.apache.flink.streaming.runtime.tasks.OperatorStateHandles], " +
-			"notifyOfCompletedCheckpoint[long], open[], setChainingStrategy[class " +
-			"org.apache.flink.streaming.api.operators.ChainingStrategy], setKeyContextElement1[class " +
-			"org.apache.flink.streaming.runtime.streamrecord.StreamRecord], " +
+	private static final String ALL_METHODS_STREAM_OPERATOR = "[" +
+			"close[], " +
+			"dispose[], " +
+			"getChainingStrategy[], " +
+			"getCurrentKey[], " +
+			"getMetricGroup[], " +
+			"getOperatorID[], " +
+			"initializeState[], " +
+			"notifyCheckpointComplete[long], " +
+			"open[], " +
+			"prepareSnapshotPreBarrier[long], " +
+			"setChainingStrategy[class org.apache.flink.streaming.api.operators.ChainingStrategy], " +
+			"setCurrentKey[class java.lang.Object], " +
+			"setKeyContextElement1[class org.apache.flink.streaming.runtime.streamrecord.StreamRecord], " +
 			"setKeyContextElement2[class org.apache.flink.streaming.runtime.streamrecord.StreamRecord], " +
-			"setup[class org.apache.flink.streaming.runtime.tasks.StreamTask, class " +
-			"org.apache.flink.streaming.api.graph.StreamConfig, interface " +
-			"org.apache.flink.streaming.api.operators.Output], snapshotState[long, long, " +
-			"interface org.apache.flink.runtime.state.CheckpointStreamFactory]]";
+			"setup[class org.apache.flink.streaming.runtime.tasks.StreamTask, class org.apache.flink.streaming.api.graph.StreamConfig, interface org.apache.flink.streaming.api.operators.Output], " +
+			"snapshotState[long, long, class org.apache.flink.runtime.checkpoint.CheckpointOptions, interface org.apache.flink.runtime.state.CheckpointStreamFactory]]";
 
 	private static final String ALL_METHODS_RICH_FUNCTION = "[close[], getIterationRuntimeContext[], getRuntimeContext[]" +
 			", open[class org.apache.flink.configuration.Configuration], setRuntimeContext[interface " +
@@ -125,7 +137,8 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 		StreamConfig cfg = new StreamConfig(new Configuration());
 		MockSourceFunction srcFun = new MockSourceFunction();
 
-		cfg.setStreamOperator(new LifecycleTrackingStreamSource(srcFun, true));
+		cfg.setStreamOperator(new LifecycleTrackingStreamSource<>(srcFun, true));
+		cfg.setOperatorID(new OperatorID());
 		cfg.setTimeCharacteristic(TimeCharacteristic.ProcessingTime);
 
 		Task task = StreamTaskTest.createTask(SourceStreamTask.class, cfg, taskManagerConfig);
@@ -147,7 +160,8 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 		Configuration taskManagerConfig = new Configuration();
 		StreamConfig cfg = new StreamConfig(new Configuration());
 		MockSourceFunction srcFun = new MockSourceFunction();
-		cfg.setStreamOperator(new LifecycleTrackingStreamSource(srcFun, false));
+		cfg.setStreamOperator(new LifecycleTrackingStreamSource<>(srcFun, false));
+		cfg.setOperatorID(new OperatorID());
 		cfg.setTimeCharacteristic(TimeCharacteristic.ProcessingTime);
 
 		Task task = StreamTaskTest.createTask(SourceStreamTask.class, cfg, taskManagerConfig);
@@ -216,9 +230,11 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 		}
 
 		@Override
-		public void run(Object lockingObject, Output<StreamRecord<OUT>> collector) throws Exception {
+		public void run(Object lockingObject,
+						StreamStatusMaintainer streamStatusMaintainer,
+						Output<StreamRecord<OUT>> collector) throws Exception {
 			ACTUAL_ORDER_TRACKING.add("OPERATOR::run");
-			super.run(lockingObject, collector);
+			super.run(lockingObject, streamStatusMaintainer, collector);
 			runStarted.trigger();
 			runFinish.await();
 		}
@@ -234,7 +250,8 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 						try {
 							runStarted.await();
 							if (getContainingTask().isCanceled() || getContainingTask().triggerCheckpoint(
-									new CheckpointMetaData(0, System.currentTimeMillis()))) {
+									new CheckpointMetaData(0, System.currentTimeMillis()),
+									CheckpointOptions.forCheckpointWithDefaultLocation())) {
 								LifecycleTrackingStreamSource.runFinish.trigger();
 							}
 						} catch (Exception e) {
@@ -257,6 +274,12 @@ public class AbstractUdfStreamOperatorLifecycleTest {
 		public void initializeState(StateInitializationContext context) throws Exception {
 			ACTUAL_ORDER_TRACKING.add("OPERATOR::initializeState");
 			super.initializeState(context);
+		}
+
+		@Override
+		public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+			ACTUAL_ORDER_TRACKING.add("OPERATOR::prepareSnapshotPreBarrier");
+			super.prepareSnapshotPreBarrier(checkpointId);
 		}
 
 		@Override

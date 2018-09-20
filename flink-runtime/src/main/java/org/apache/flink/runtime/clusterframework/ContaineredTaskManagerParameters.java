@@ -18,8 +18,10 @@
 
 package org.apache.flink.runtime.clusterframework;
 
-import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ResourceManagerOptions;
+import org.apache.flink.runtime.taskexecutor.TaskManagerServices;
+import org.apache.flink.util.Preconditions;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -30,23 +32,22 @@ import java.util.Map;
 public class ContaineredTaskManagerParameters implements java.io.Serializable {
 
 	private static final long serialVersionUID = -3096987654278064670L;
-	
-	/** Total container memory, in bytes */
+
+	/** Total container memory, in bytes. */
 	private final long totalContainerMemoryMB;
 
-	/** Heap size to be used for the Java process */
+	/** Heap size to be used for the Java process. */
 	private final long taskManagerHeapSizeMB;
 
-	/** Direct memory limit for the Java process */
+	/** Direct memory limit for the Java process. */
 	private final long taskManagerDirectMemoryLimitMB;
 
-	/** The number of slots per TaskManager */
+	/** The number of slots per TaskManager. */
 	private final int numSlots;
-	
-	/** Environment variables to add to the Java process */
+
+	/** Environment variables to add to the Java process. */
 	private final HashMap<String, String> taskManagerEnv;
 
-	
 	public ContaineredTaskManagerParameters(
 			long totalContainerMemoryMB,
 			long taskManagerHeapSizeMB,
@@ -60,7 +61,7 @@ public class ContaineredTaskManagerParameters implements java.io.Serializable {
 		this.numSlots = numSlots;
 		this.taskManagerEnv = taskManagerEnv;
 	}
-	
+
 	// ------------------------------------------------------------------------
 
 	public long taskManagerTotalMemoryMB() {
@@ -85,7 +86,7 @@ public class ContaineredTaskManagerParameters implements java.io.Serializable {
 
 
 	// ------------------------------------------------------------------------
-	
+
 	@Override
 	public String toString() {
 		return "TaskManagerParameters {" +
@@ -100,7 +101,47 @@ public class ContaineredTaskManagerParameters implements java.io.Serializable {
 	// ------------------------------------------------------------------------
 	//  Factory
 	// ------------------------------------------------------------------------
-	
+
+	/**
+	 * Calcuate cutoff memory size used by container, it will throw an {@link IllegalArgumentException}
+	 * if the config is invalid or return the cutoff value if valid.
+	 *
+	 * @param config The Flink configuration.
+	 * @param containerMemoryMB The size of the complete container, in megabytes.
+	 *
+	 * @return cutoff memory size used by container.
+	 */
+	public static long calculateCutoffMB(Configuration config, long containerMemoryMB) {
+		Preconditions.checkArgument(containerMemoryMB > 0);
+
+		// (1) check cutoff ratio
+		final float memoryCutoffRatio = config.getFloat(
+			ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_RATIO);
+
+		if (memoryCutoffRatio >= 1 || memoryCutoffRatio <= 0) {
+			throw new IllegalArgumentException("The configuration value '"
+				+ ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_RATIO.key() + "' must be between 0 and 1. Value given="
+				+ memoryCutoffRatio);
+		}
+
+		// (2) check min cutoff value
+		final int minCutoff = config.getInteger(
+			ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_MIN);
+
+		if (minCutoff >= containerMemoryMB) {
+			throw new IllegalArgumentException("The configuration value '"
+				+ ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_MIN.key() + "'='" + minCutoff
+				+ "' is larger than the total container memory " + containerMemoryMB);
+		}
+
+		// (3) check between heap and off-heap
+		long cutoff = (long) (containerMemoryMB * memoryCutoffRatio);
+		if (cutoff < minCutoff) {
+			cutoff = minCutoff;
+		}
+		return cutoff;
+	}
+
 	/**
 	 * Computes the parameters to be used to start a TaskManager Java process.
 	 *
@@ -109,65 +150,21 @@ public class ContaineredTaskManagerParameters implements java.io.Serializable {
 	 * @return The parameters to start the TaskManager processes with.
 	 */
 	public static ContaineredTaskManagerParameters create(
-		Configuration config, long containerMemoryMB, int numSlots)
-	{
-		// (1) compute how much memory we subtract from the total memory, to get the Java memory
+			Configuration config,
+			long containerMemoryMB,
+			int numSlots) {
+		// (1) try to compute how much memory used by container
+		final long cutoffMB = calculateCutoffMB(config, containerMemoryMB);
 
-		final float memoryCutoffRatio = config.getFloat(
-			ConfigConstants.CONTAINERIZED_HEAP_CUTOFF_RATIO,
-			ConfigConstants.DEFAULT_YARN_HEAP_CUTOFF_RATIO);
+		// (2) split the remaining Java memory between heap and off-heap
+		final long heapSizeMB = TaskManagerServices.calculateHeapSizeMB(containerMemoryMB - cutoffMB, config);
+		// use the cut-off memory for off-heap (that was its intention)
+		final long offHeapSizeMB = containerMemoryMB - heapSizeMB;
 
-		final int minCutoff = config.getInteger(
-			ConfigConstants.CONTAINERIZED_HEAP_CUTOFF_MIN,
-			ConfigConstants.DEFAULT_YARN_HEAP_CUTOFF);
-
-		if (memoryCutoffRatio >= 1 || memoryCutoffRatio <= 0) {
-			throw new IllegalArgumentException("The configuration value '"
-				+ ConfigConstants.CONTAINERIZED_HEAP_CUTOFF_RATIO + "' must be between 0 and 1. Value given="
-				+ memoryCutoffRatio);
-		}
-
-		if (minCutoff >= containerMemoryMB) {
-			throw new IllegalArgumentException("The configuration value '"
-				+ ConfigConstants.CONTAINERIZED_HEAP_CUTOFF_MIN + "'='" + minCutoff
-				+ "' is larger than the total container memory " + containerMemoryMB);
-		}
-
-		long cutoff = (long) (containerMemoryMB * memoryCutoffRatio);
-		if (cutoff < minCutoff) {
-			cutoff = minCutoff;
-		}
-
-		final long javaMemorySizeMB = containerMemoryMB - cutoff;
-
-		// (2) split the Java memory between heap and off-heap
-
-		final boolean useOffHeap = config.getBoolean(
-			ConfigConstants.TASK_MANAGER_MEMORY_OFF_HEAP_KEY, false);
-
-		final long heapSizeMB;
-		if (useOffHeap) {
-			long offHeapSize = config.getLong(
-				ConfigConstants.TASK_MANAGER_MEMORY_SIZE_KEY, -1L);
-
-			if (offHeapSize <= 0) {
-				double fraction = config.getFloat(
-					ConfigConstants.TASK_MANAGER_MEMORY_FRACTION_KEY,
-					ConfigConstants.DEFAULT_MEMORY_MANAGER_MEMORY_FRACTION);
-
-
-				offHeapSize = (long) (fraction * javaMemorySizeMB);
-			}
-
-			heapSizeMB = javaMemorySizeMB - offHeapSize;
-		} else {
-			heapSizeMB = javaMemorySizeMB;
-		}
-		
 		// (3) obtain the additional environment variables from the configuration
 		final HashMap<String, String> envVars = new HashMap<>();
-		final String prefix = ConfigConstants.CONTAINERIZED_TASK_MANAGER_ENV_PREFIX;
-		
+		final String prefix = ResourceManagerOptions.CONTAINERIZED_TASK_MANAGER_ENV_PREFIX;
+
 		for (String key : config.keySet()) {
 			if (key.startsWith(prefix) && key.length() > prefix.length()) {
 				// remove prefix
@@ -175,9 +172,9 @@ public class ContaineredTaskManagerParameters implements java.io.Serializable {
 				envVars.put(envVarKey, config.getString(key, null));
 			}
 		}
-		
+
 		// done
 		return new ContaineredTaskManagerParameters(
-			containerMemoryMB, heapSizeMB, javaMemorySizeMB, numSlots, envVars);
+			containerMemoryMB, heapSizeMB, offHeapSizeMB, numSlots, envVars);
 	}
 }

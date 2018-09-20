@@ -18,15 +18,19 @@
 
 package org.apache.flink.configuration;
 
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.util.Preconditions;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
-
-import org.apache.flink.annotation.Internal;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Global configuration object for Flink. Similar to Java properties configuration
@@ -38,6 +42,12 @@ public final class GlobalConfiguration {
 	private static final Logger LOG = LoggerFactory.getLogger(GlobalConfiguration.class);
 
 	public static final String FLINK_CONF_FILENAME = "flink-conf.yaml";
+
+	// the keys whose values should be hidden
+	private static final String[] SENSITIVE_KEYS = new String[] {"password", "secret"};
+
+	// the hidden content to be displayed
+	public static final String HIDDEN_CONTENT = "******";
 
 	// --------------------------------------------------------------------------------------------
 
@@ -57,18 +67,30 @@ public final class GlobalConfiguration {
 		if (configDir == null) {
 			return new Configuration();
 		}
-		return loadConfiguration(configDir);
+		return loadConfiguration(configDir, null);
 	}
 
 	/**
 	 * Loads the configuration files from the specified directory.
-	 * <p>
-	 * YAML files are supported as configuration files.
-	 * 
+	 *
+	 * <p>YAML files are supported as configuration files.
+	 *
 	 * @param configDir
 	 *        the directory which contains the configuration files
 	 */
 	public static Configuration loadConfiguration(final String configDir) {
+		return loadConfiguration(configDir, null);
+	}
+
+	/**
+	 * Loads the configuration files from the specified directory. If the dynamic properties
+	 * configuration is not null, then it is added to the loaded configuration.
+	 *
+	 * @param configDir directory to load the configuration from
+	 * @param dynamicProperties configuration file containing the dynamic properties. Null if none.
+	 * @return The configuration loaded from the given configuration directory
+	 */
+	public static Configuration loadConfiguration(final String configDir, @Nullable final Configuration dynamicProperties) {
 
 		if (configDir == null) {
 			throw new IllegalArgumentException("Given configuration directory is null, cannot load configuration");
@@ -90,26 +112,48 @@ public final class GlobalConfiguration {
 					"' (" + confDirFile.getAbsolutePath() + ") does not exist.");
 		}
 
-		return loadYAMLResource(yamlConfigFile);
+		Configuration configuration = loadYAMLResource(yamlConfigFile);
+
+		if (dynamicProperties != null) {
+			configuration.addAll(dynamicProperties);
+		}
+
+		return configuration;
+	}
+
+	/**
+	 * Loads the global configuration and adds the given dynamic properties
+	 * configuration.
+	 *
+	 * @param dynamicProperties The given dynamic properties
+	 * @return Returns the loaded global configuration with dynamic properties
+	 */
+	public static Configuration loadConfigurationWithDynamicProperties(Configuration dynamicProperties) {
+		final String configDir = System.getenv(ConfigConstants.ENV_FLINK_CONF_DIR);
+		if (configDir == null) {
+			return new Configuration(dynamicProperties);
+		}
+
+		return loadConfiguration(configDir, dynamicProperties);
 	}
 
 	/**
 	 * Loads a YAML-file of key-value pairs.
-	 * <p>
-	 * Colon and whitespace ": " separate key and value (one per line). The hash tag "#" starts a single-line comment.
-	 * <p>
-	 * Example:
-	 * 
+	 *
+	 * <p>Colon and whitespace ": " separate key and value (one per line). The hash tag "#" starts a single-line comment.
+	 *
+	 * <p>Example:
+	 *
 	 * <pre>
 	 * jobmanager.rpc.address: localhost # network address for communication with the job manager
 	 * jobmanager.rpc.port   : 6123      # network port to connect to for communication with the job manager
 	 * taskmanager.rpc.port  : 6122      # network port the task manager expects incoming IPC connections
 	 * </pre>
-	 * <p>
-	 * This does not span the whole YAML specification, but only the *syntax* of simple YAML key-value pairs (see issue
+	 *
+	 * <p>This does not span the whole YAML specification, but only the *syntax* of simple YAML key-value pairs (see issue
 	 * #113 on GitHub). If at any point in time, there is a need to go beyond simple key-value pairs syntax
 	 * compatibility will allow to introduce a YAML parser library.
-	 * 
+	 *
 	 * @param file the YAML file to read from
 	 * @see <a href="http://www.yaml.org/spec/1.2/spec.html">YAML 1.2 specification</a>
 	 */
@@ -119,11 +163,12 @@ public final class GlobalConfiguration {
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file)))){
 
 			String line;
+			int lineNo = 0;
 			while ((line = reader.readLine()) != null) {
-
+				lineNo++;
 				// 1. check for comments
 				String[] comments = line.split("#", 2);
-				String conf = comments[0];
+				String conf = comments[0].trim();
 
 				// 2. get key and value
 				if (conf.length() > 0) {
@@ -131,7 +176,7 @@ public final class GlobalConfiguration {
 
 					// skip line with no valid key-value pair
 					if (kv.length == 1) {
-						LOG.warn("Error while trying to split key and value in configuration file " + file + ": " + line);
+						LOG.warn("Error while trying to split key and value in configuration file " + file + ":" + lineNo + ": \"" + line + "\"");
 						continue;
 					}
 
@@ -140,11 +185,11 @@ public final class GlobalConfiguration {
 
 					// sanity check
 					if (key.length() == 0 || value.length() == 0) {
-						LOG.warn("Error after splitting key and value in configuration file " + file + ": " + line);
+						LOG.warn("Error after splitting key and value in configuration file " + file + ":" + lineNo + ": \"" + line + "\"");
 						continue;
 					}
 
-					LOG.debug("Loading configuration property: {}, {}", key, value);
+					LOG.info("Loading configuration property: {}, {}", key, isSensitive(key) ? HIDDEN_CONTENT : value);
 					config.setString(key, value);
 				}
 			}
@@ -155,4 +200,20 @@ public final class GlobalConfiguration {
 		return config;
 	}
 
+	/**
+	 * Check whether the key is a hidden key.
+	 *
+	 * @param key the config key
+	 */
+	public static boolean isSensitive(String key) {
+		Preconditions.checkNotNull(key, "key is null");
+		final String keyInLower = key.toLowerCase();
+		for (String hideKey : SENSITIVE_KEYS) {
+			if (keyInLower.length() >= hideKey.length()
+				&& keyInLower.contains(hideKey)) {
+				return true;
+			}
+		}
+		return false;
+	}
 }

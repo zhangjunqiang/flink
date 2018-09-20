@@ -22,88 +22,91 @@ import org.apache.flink.core.fs.FSDataInputStream;
 import org.apache.flink.util.Preconditions;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Map;
 
 /**
- * State handle for partitionable operator state. Besides being a {@link StreamStateHandle}, this also provides a
- * map that contains the offsets to the partitions of named states in the stream.
+ * Interface of a state handle for operator state.
  */
-public class OperatorStateHandle implements StreamStateHandle {
+public interface OperatorStateHandle extends StreamStateHandle {
 
-	private static final long serialVersionUID = 35876522969227335L;
+	/**
+	 * Returns a map of meta data for all contained states by their name.
+	 */
+	Map<String, StateMetaInfo> getStateNameToPartitionOffsets();
 
-	/** unique state name -> offsets for available partitions in the handle stream */
-	private final Map<String, long[]> stateNameToPartitionOffsets;
-	private final StreamStateHandle delegateStateHandle;
-
-	public OperatorStateHandle(
-			Map<String, long[]> stateNameToPartitionOffsets,
-			StreamStateHandle delegateStateHandle) {
-
-		this.delegateStateHandle = Preconditions.checkNotNull(delegateStateHandle);
-		this.stateNameToPartitionOffsets = Preconditions.checkNotNull(stateNameToPartitionOffsets);
-	}
-
-	public Map<String, long[]> getStateNameToPartitionOffsets() {
-		return stateNameToPartitionOffsets;
-	}
-
+	/**
+	 * Returns an input stream to read the operator state information.
+	 */
 	@Override
-	public void discardState() throws Exception {
-		delegateStateHandle.discardState();
+	FSDataInputStream openInputStream() throws IOException;
+
+	/**
+	 * Returns the underlying stream state handle that points to the state data.
+	 */
+	StreamStateHandle getDelegateStateHandle();
+
+	/**
+	 * The modes that determine how an {@link OperatorStreamStateHandle} is assigned to tasks during restore.
+	 */
+	enum Mode {
+		SPLIT_DISTRIBUTE,	// The operator state partitions in the state handle are split and distributed to one task each.
+		UNION,				// The operator state partitions are UNION-ed upon restoring and sent to all tasks.
+		BROADCAST			// The operator states are identical, as the state is produced from a broadcast stream.
 	}
 
-	@Override
-	public long getStateSize() throws IOException {
-		return delegateStateHandle.getStateSize();
-	}
+	/**
+	 * Meta information about the operator state handle.
+	 */
+	class StateMetaInfo implements Serializable {
 
-	@Override
-	public FSDataInputStream openInputStream() throws IOException {
-		return delegateStateHandle.openInputStream();
-	}
+		private static final long serialVersionUID = 3593817615858941166L;
 
-	public StreamStateHandle getDelegateStateHandle() {
-		return delegateStateHandle;
-	}
+		private final long[] offsets;
+		private final Mode distributionMode;
 
-	@Override
-	public boolean equals(Object o) {
-		if (this == o) {
-			return true;
+		public StateMetaInfo(long[] offsets, Mode distributionMode) {
+			this.offsets = Preconditions.checkNotNull(offsets);
+			this.distributionMode = Preconditions.checkNotNull(distributionMode);
 		}
 
-		if (!(o instanceof OperatorStateHandle)) {
-			return false;
+		public long[] getOffsets() {
+			return offsets;
 		}
 
-		OperatorStateHandle that = (OperatorStateHandle) o;
-
-		if(stateNameToPartitionOffsets.size() != that.stateNameToPartitionOffsets.size()) {
-			return false;
+		public Mode getDistributionMode() {
+			return distributionMode;
 		}
 
-		for (Map.Entry<String, long[]> entry : stateNameToPartitionOffsets.entrySet()) {
-			if (!Arrays.equals(entry.getValue(), that.stateNameToPartitionOffsets.get(entry.getKey()))) {
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) {
+				return true;
+			}
+			if (o == null || getClass() != o.getClass()) {
 				return false;
 			}
+
+			StateMetaInfo that = (StateMetaInfo) o;
+
+			return Arrays.equals(getOffsets(), that.getOffsets())
+				&& getDistributionMode() == that.getDistributionMode();
 		}
 
-		return delegateStateHandle.equals(that.delegateStateHandle);
-	}
-
-	@Override
-	public int hashCode() {
-		int result = delegateStateHandle.hashCode();
-		for (Map.Entry<String, long[]> entry : stateNameToPartitionOffsets.entrySet()) {
-
-			int entryHash = entry.getKey().hashCode();
-			if (entry.getValue() != null) {
-				entryHash += Arrays.hashCode(entry.getValue());
-			}
-			result = 31 * result + entryHash;
+		@Override
+		public int hashCode() {
+			int result = Arrays.hashCode(getOffsets());
+			result = 31 * result + getDistributionMode().hashCode();
+			return result;
 		}
-		return result;
+
+		@Override
+		public String toString() {
+			return "StateMetaInfo{" +
+					"offsets=" + Arrays.toString(offsets) +
+					", distributionMode=" + distributionMode +
+					'}';
+		}
 	}
 }

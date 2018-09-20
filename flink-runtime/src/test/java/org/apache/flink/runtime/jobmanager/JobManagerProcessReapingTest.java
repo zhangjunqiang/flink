@@ -26,9 +26,14 @@ import static org.apache.flink.runtime.testutils.CommonTestUtils.isProcessAlive;
 import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 import akka.actor.PoisonPill;
-import org.apache.flink.configuration.ConfigConstants;
+
+import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.runtime.akka.AkkaUtils;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils;
+import org.apache.flink.runtime.jobmaster.JobMaster;
+import org.apache.flink.runtime.rpc.akka.AkkaRpcServiceUtils;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
+import org.apache.flink.util.TestLogger;
 import org.junit.Test;
 
 import org.apache.flink.configuration.Configuration;
@@ -40,7 +45,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringWriter;
-import java.net.InetSocketAddress;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -48,7 +52,7 @@ import java.util.regex.Pattern;
 /**
  * Tests that the JobManager process properly exits when the JobManager actor dies.
  */
-public class JobManagerProcessReapingTest {
+public class JobManagerProcessReapingTest extends TestLogger {
 
 	@Test
 	public void testReapProcessOnFailure() {
@@ -117,10 +121,14 @@ public class JobManagerProcessReapingTest {
 
 			if (jobManagerPort != -1) {
 				try {
-					jobManagerRef = JobManager.getJobManagerActorRef(
-						"akka.tcp",
-						new InetSocketAddress("localhost", jobManagerPort),
-						localSystem, new FiniteDuration(25, TimeUnit.SECONDS));
+					final String jobManagerAkkaUrl = AkkaRpcServiceUtils.getRpcUrl(
+						"localhost",
+						jobManagerPort,
+						JobMaster.JOB_MANAGER_NAME,
+						HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION,
+						AkkaRpcServiceUtils.AkkaProtocol.TCP);
+
+					jobManagerRef = AkkaUtils.getActorRef(jobManagerAkkaUrl, localSystem, new FiniteDuration(25L, TimeUnit.SECONDS));
 				} catch (Throwable t) {
 					// job manager probably not ready yet
 					lastError = t;
@@ -174,7 +182,7 @@ public class JobManagerProcessReapingTest {
 				jmProcess.destroy();
 			}
 			if (localSystem != null) {
-				localSystem.shutdown();
+				localSystem.terminate();
 			}
 		}
 	}
@@ -196,7 +204,7 @@ public class JobManagerProcessReapingTest {
 		public static void main(String[] args) {
 			try {
 				Configuration config = new Configuration();
-				config.setInteger(ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, -1);
+				config.setInteger(WebOptions.PORT, -1);
 
 				JobManager.runJobManager(config, JobManagerMode.CLUSTER, "localhost", 0);
 				System.exit(0);

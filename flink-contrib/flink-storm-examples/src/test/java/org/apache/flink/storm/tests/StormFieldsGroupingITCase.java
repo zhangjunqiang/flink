@@ -15,20 +15,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.storm.tests;
 
-import backtype.storm.Config;
-import backtype.storm.topology.TopologyBuilder;
-import backtype.storm.tuple.Fields;
 import org.apache.flink.storm.api.FlinkLocalCluster;
 import org.apache.flink.storm.api.FlinkTopology;
 import org.apache.flink.storm.tests.operators.FiniteRandomSpout;
 import org.apache.flink.storm.tests.operators.TaskIdBolt;
 import org.apache.flink.storm.util.BoltFileSink;
 import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.util.StreamingProgramTestBase;
+import org.apache.flink.test.util.AbstractTestBase;
 import org.apache.flink.util.MathUtils;
+
+import org.apache.storm.Config;
+import org.apache.storm.topology.TopologyBuilder;
+import org.apache.storm.tuple.Fields;
 import org.junit.Assert;
+import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,50 +42,18 @@ import java.util.List;
  * This test relies on the hash function used by the {@link DataStream#keyBy}, which is
  * assumed to be {@link MathUtils#murmurHash}.
  */
-public class StormFieldsGroupingITCase extends StreamingProgramTestBase {
+public class StormFieldsGroupingITCase extends AbstractTestBase {
 
-	private final static String topologyId = "FieldsGrouping Test";
-	private final static String spoutId = "spout";
-	private final static String boltId = "bolt";
-	private final static String sinkId = "sink";
-	private String resultPath;
+	private static final String topologyId = "FieldsGrouping Test";
+	private static final String spoutId = "spout";
+	private static final String boltId = "bolt";
+	private static final String sinkId = "sink";
 
-	@Override
-	protected void preSubmit() throws Exception {
-		this.resultPath = this.getTempDirPath("result");
-	}
+	@Test
+	public void testProgram() throws Exception {
+		String resultPath = this.getTempDirPath("result");
 
-	@Override
-	protected void postSubmit() throws Exception {
-		List<String> expectedResults = Arrays.asList(
-				"-1155484576", "1033096058", "-1930858313", "1431162155", "-1557280266", "-1728529858", "1654374947",
-				"-65105105", "-518907128", "-252332814");
-
-		List<String> actualResults = new ArrayList<>();
-		readAllResultLines(actualResults, resultPath, new String[0], false);
-
-		//remove potential operator id prefix
-		for(int i = 0; i < actualResults.size(); ++i) {
-			String s = actualResults.get(i);
-			if(s.contains(">")) {
-				s = s.substring(s.indexOf(">") + 2);
-				actualResults.set(i, s);
-			}
-		}
-
-		Assert.assertEquals(expectedResults.size(),actualResults.size());
-		Collections.sort(actualResults);
-		Collections.sort(expectedResults);
-		System.out.println(actualResults);
-		for(int i=0; i< actualResults.size(); ++i) {
-			//compare against actual results with removed prefex (as it depends e.g. on the hash function used)
-			Assert.assertEquals(expectedResults.get(i), actualResults.get(i));
-		}
-	}
-
-	@Override
-	protected void testProgram() throws Exception {
-		final String[] tokens = this.resultPath.split(":");
+		final String[] tokens = resultPath.split(":");
 		final String outputFile = tokens[tokens.length - 1];
 
 		final TopologyBuilder builder = new TopologyBuilder();
@@ -97,6 +68,31 @@ public class StormFieldsGroupingITCase extends StreamingProgramTestBase {
 		conf.put(FlinkLocalCluster.SUBMIT_BLOCKING, true); // only required to stabilize integration test
 		cluster.submitTopology(topologyId, conf, FlinkTopology.createTopology(builder));
 		cluster.shutdown();
+
+		List<String> expectedResults = Arrays.asList(
+			"-1155484576", "1033096058", "-1930858313", "1431162155", "-1557280266", "-1728529858", "1654374947",
+			"-65105105", "-518907128", "-252332814");
+
+		List<String> actualResults = new ArrayList<>();
+		readAllResultLines(actualResults, resultPath, new String[0], false);
+
+		//remove potential operator id prefix
+		for (int i = 0; i < actualResults.size(); ++i) {
+			String s = actualResults.get(i);
+			if (s.contains(">")) {
+				s = s.substring(s.indexOf(">") + 2);
+				actualResults.set(i, s);
+			}
+		}
+
+		Assert.assertEquals(expectedResults.size(), actualResults.size());
+		Collections.sort(actualResults);
+		Collections.sort(expectedResults);
+		System.out.println(actualResults);
+		for (int i = 0; i < actualResults.size(); ++i) {
+			//compare against actual results with removed prefix (as it depends e.g. on the hash function used)
+			Assert.assertEquals(expectedResults.get(i), actualResults.get(i));
+		}
 	}
 
 }

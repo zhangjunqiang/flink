@@ -17,35 +17,36 @@
 
 package org.apache.flink.storm.wrappers;
 
-import backtype.storm.task.OutputCollector;
-import backtype.storm.task.TopologyContext;
-import backtype.storm.topology.IRichBolt;
-import backtype.storm.topology.OutputFieldsDeclarer;
-import backtype.storm.tuple.Fields;
-import backtype.storm.tuple.MessageId;
-import backtype.storm.tuple.Values;
-import backtype.storm.utils.Utils;
-
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.TaskInfo;
 import org.apache.flink.api.java.tuple.Tuple;
 import org.apache.flink.api.java.tuple.Tuple1;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.UnmodifiableConfiguration;
+import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.runtime.execution.Environment;
-import org.apache.flink.runtime.operators.testutils.UnregisteredTaskMetricsGroup;
-import org.apache.flink.runtime.taskmanager.TaskManagerRuntimeInfo;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
+import org.apache.flink.runtime.util.TestingTaskManagerRuntimeInfo;
 import org.apache.flink.storm.util.AbstractTest;
 import org.apache.flink.storm.util.SplitStreamType;
 import org.apache.flink.storm.util.StormConfig;
 import org.apache.flink.storm.util.TestDummyBolt;
-import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.runtime.streamrecord.StreamElementSerializer;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
+import org.apache.flink.streaming.util.MockStreamConfig;
+
+import org.apache.storm.task.OutputCollector;
+import org.apache.storm.task.TopologyContext;
+import org.apache.storm.topology.IRichBolt;
+import org.apache.storm.topology.OutputFieldsDeclarer;
+import org.apache.storm.tuple.Fields;
+import org.apache.storm.tuple.MessageId;
+import org.apache.storm.tuple.Values;
+import org.apache.storm.utils.Utils;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -67,6 +68,9 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+/**
+ * Tests for the BoltWrapper.
+ */
 @RunWith(PowerMockRunner.class)
 @PrepareForTest({StreamElementSerializer.class, WrapperSetupHelper.class, StreamRecord.class})
 @PowerMockIgnore({"javax.management.*", "com.sun.jndi.*", "org.apache.log4j.*"})
@@ -155,7 +159,7 @@ public class BoltWrapperTest extends AbstractTest {
 		PowerMockito.whenNew(SetupOutputFieldsDeclarer.class).withNoArguments().thenReturn(declarer);
 
 		final BoltWrapper wrapper = new BoltWrapper(bolt, (Fields) null);
-		wrapper.setup(createMockStreamTask(), new StreamConfig(new Configuration()), mock(Output.class));
+		wrapper.setup(createMockStreamTask(), new MockStreamConfig(), mock(Output.class));
 		wrapper.open();
 
 		wrapper.processElement(record);
@@ -191,7 +195,7 @@ public class BoltWrapperTest extends AbstractTest {
 		}
 
 		final BoltWrapper wrapper = new BoltWrapper(bolt, null, raw);
-		wrapper.setup(createMockStreamTask(), new StreamConfig(new Configuration()), output);
+		wrapper.setup(createMockStreamTask(), new MockStreamConfig(), output);
 		wrapper.open();
 
 		final SplitStreamType splitRecord = new SplitStreamType<Integer>();
@@ -244,7 +248,7 @@ public class BoltWrapperTest extends AbstractTest {
 
 			final IRichBolt bolt = mock(IRichBolt.class);
 			BoltWrapper<Object, Object> wrapper = new BoltWrapper<Object, Object>(bolt);
-			wrapper.setup(createMockStreamTask(execConfig), new StreamConfig(new Configuration()), mock(Output.class));
+			wrapper.setup(createMockStreamTask(execConfig), new MockStreamConfig(), mock(Output.class));
 
 			wrapper.open();
 			verify(bolt).prepare(any(Map.class), any(TopologyContext.class), any(OutputCollector.class));
@@ -257,7 +261,7 @@ public class BoltWrapperTest extends AbstractTest {
 
 			final IRichBolt bolt = mock(IRichBolt.class);
 			BoltWrapper<Object, Object> wrapper = new BoltWrapper<Object, Object>(bolt);
-			wrapper.setup(createMockStreamTask(execConfig), new StreamConfig(new Configuration()), mock(Output.class));
+			wrapper.setup(createMockStreamTask(execConfig), new MockStreamConfig(), mock(Output.class));
 
 			wrapper.open();
 			verify(bolt).prepare(same(stormConfig), any(TopologyContext.class), any(OutputCollector.class));
@@ -274,7 +278,7 @@ public class BoltWrapperTest extends AbstractTest {
 
 			TestDummyBolt testBolt = new TestDummyBolt();
 			BoltWrapper<Object, Object> wrapper = new BoltWrapper<Object, Object>(testBolt);
-			wrapper.setup(createMockStreamTask(execConfig), new StreamConfig(new Configuration()), mock(Output.class));
+			wrapper.setup(createMockStreamTask(execConfig), new MockStreamConfig(), mock(Output.class));
 
 			wrapper.open();
 			for (Entry<String, String> entry : cfg.toMap().entrySet()) {
@@ -301,7 +305,7 @@ public class BoltWrapperTest extends AbstractTest {
 		final IRichBolt bolt = mock(IRichBolt.class);
 		BoltWrapper<Object, Object> wrapper = new BoltWrapper<Object, Object>(bolt);
 
-		wrapper.setup(createMockStreamTask(), new StreamConfig(new Configuration()), mock(Output.class));
+		wrapper.setup(createMockStreamTask(), new MockStreamConfig(), mock(Output.class));
 		wrapper.open();
 
 		verify(bolt).prepare(any(Map.class), any(TopologyContext.class), isNotNull(OutputCollector.class));
@@ -318,7 +322,7 @@ public class BoltWrapperTest extends AbstractTest {
 
 		final BoltWrapper<Object, Object> wrapper = new BoltWrapper<Object, Object>(bolt);
 
-		wrapper.setup(createMockStreamTask(), new StreamConfig(new Configuration()), mock(Output.class));
+		wrapper.setup(createMockStreamTask(), new MockStreamConfig(), mock(Output.class));
 
 		wrapper.close();
 		wrapper.dispose();
@@ -338,7 +342,7 @@ public class BoltWrapperTest extends AbstractTest {
 
 		int counter = 0;
 		@Override
-		public void execute(backtype.storm.tuple.Tuple input) {
+		public void execute(org.apache.storm.tuple.Tuple input) {
 			if (++counter % 2 == 1) {
 				this.collector.emit("stream1", new Values(input.getInteger(0)));
 			} else {
@@ -369,14 +373,16 @@ public class BoltWrapperTest extends AbstractTest {
 		Environment env = mock(Environment.class);
 		when(env.getTaskInfo()).thenReturn(new TaskInfo("Mock Task", 1, 0, 1, 0));
 		when(env.getUserClassLoader()).thenReturn(BoltWrapperTest.class.getClassLoader());
-		when(env.getMetricGroup()).thenReturn(new UnregisteredTaskMetricsGroup());
-		when(env.getTaskManagerInfo()).thenReturn(new TaskManagerRuntimeInfo("foo", new Configuration(), "foo"));
+		when(env.getMetricGroup()).thenReturn(UnregisteredMetricGroups.createUnregisteredTaskMetricGroup());
+		when(env.getTaskManagerInfo()).thenReturn(new TestingTaskManagerRuntimeInfo());
 
+		final CloseableRegistry closeableRegistry = new CloseableRegistry();
 		StreamTask<?, ?> mockTask = mock(StreamTask.class);
 		when(mockTask.getCheckpointLock()).thenReturn(new Object());
-		when(mockTask.getConfiguration()).thenReturn(new StreamConfig(new Configuration()));
+		when(mockTask.getConfiguration()).thenReturn(new MockStreamConfig());
 		when(mockTask.getEnvironment()).thenReturn(env);
 		when(mockTask.getExecutionConfig()).thenReturn(execConfig);
+		when(mockTask.getCancelables()).thenReturn(closeableRegistry);
 
 		return mockTask;
 	}

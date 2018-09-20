@@ -18,6 +18,9 @@
 
 package org.apache.flink.core.testutils;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -31,6 +34,7 @@ import java.util.concurrent.TimeoutException;
 public final class OneShotLatch {
 
 	private final Object lock = new Object();
+	private final Set<Thread> waitersSet = Collections.newSetFromMap(new IdentityHashMap<>());
 
 	private volatile boolean triggered;
 
@@ -45,31 +49,37 @@ public final class OneShotLatch {
 	}
 
 	/**
-	 * Waits until {@link #trigger())} is called. Once {@code #trigger()} has been called this
+	 * Waits until {@link OneShotLatch#trigger()} is called. Once {@code trigger()} has been called this
 	 * call will always return immediately.
-	 * 
+	 *
 	 * @throws InterruptedException Thrown if the thread is interrupted while waiting.
 	 */
 	public void await() throws InterruptedException {
 		synchronized (lock) {
 			while (!triggered) {
-				lock.wait();
+				Thread thread = Thread.currentThread();
+				try {
+					waitersSet.add(thread);
+					lock.wait();
+				} finally {
+					waitersSet.remove(thread);
+				}
 			}
 		}
 	}
 
 	/**
-	 * Waits until {@link #trigger())} is called. Once {@code #trigger()} has been called this
+	 * Waits until {@link OneShotLatch#trigger()} is called. Once {@code #trigger()} has been called this
 	 * call will always return immediately.
-	 * 
+	 *
 	 * <p>If the latch is not triggered within the given timeout, a {@code TimeoutException}
 	 * will be thrown after the timeout.
-	 * 
+	 *
 	 * <p>A timeout value of zero means infinite timeout and make this equivalent to {@link #await()}.
-	 * 
+	 *
 	 * @param timeout   The value of the timeout, a value of zero indicating infinite timeout.
 	 * @param timeUnit  The unit of the timeout
-	 * 
+	 *
 	 * @throws InterruptedException Thrown if the thread is interrupted while waiting.
 	 * @throws TimeoutException Thrown, if the latch is not triggered within the timeout time.
 	 */
@@ -101,10 +111,30 @@ public final class OneShotLatch {
 
 	/**
 	 * Checks if the latch was triggered.
-	 * 
+	 *
 	 * @return True, if the latch was triggered, false if not.
 	 */
 	public boolean isTriggered() {
 		return triggered;
+	}
+
+	public int getWaitersCount() {
+		synchronized (lock) {
+			return waitersSet.size();
+		}
+	}
+
+	/**
+	 * Resets the latch so that {@link #isTriggered()} returns false.
+	 */
+	public void reset() {
+		synchronized (lock) {
+			triggered = false;
+		}
+	}
+
+	@Override
+	public String toString() {
+		return "Latch " + (triggered ? "TRIGGERED" : "PENDING");
 	}
 }

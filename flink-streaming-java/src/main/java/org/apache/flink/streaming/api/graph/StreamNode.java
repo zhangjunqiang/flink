@@ -17,20 +17,22 @@
 
 package org.apache.flink.streaming.api.graph;
 
-import java.io.Serializable;
-import java.util.ArrayList;
-import java.util.List;
-
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.io.InputFormat;
+import org.apache.flink.api.common.operators.ResourceSpec;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.streaming.api.collector.selector.OutputSelector;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.operators.StreamOperator;
-import org.apache.flink.util.Preconditions;
+
+import javax.annotation.Nullable;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Class representing the operators in the streaming programs, with all their properties.
@@ -40,7 +42,7 @@ public class StreamNode implements Serializable {
 
 	private static final long serialVersionUID = 1L;
 
-	transient private StreamExecutionEnvironment env;
+	private transient StreamExecutionEnvironment env;
 
 	private final int id;
 	private Integer parallelism = null;
@@ -49,11 +51,14 @@ public class StreamNode implements Serializable {
 	 * dynamic scaling and the number of key groups used for partitioned state.
 	 */
 	private int maxParallelism;
+	private ResourceSpec minResources = ResourceSpec.DEFAULT;
+	private ResourceSpec preferredResources = ResourceSpec.DEFAULT;
 	private Long bufferTimeout = null;
 	private final String operatorName;
 	private String slotSharingGroup;
-	private KeySelector<?,?> statePartitioner1;
-	private KeySelector<?,?> statePartitioner2;
+	private @Nullable String coLocationGroup;
+	private KeySelector<?, ?> statePartitioner1;
+	private KeySelector<?, ?> statePartitioner2;
 	private TypeSerializer<?> stateKeySerializer;
 
 	private transient StreamOperator<?> operator;
@@ -69,15 +74,18 @@ public class StreamNode implements Serializable {
 
 	private InputFormat<?, ?> inputFormat;
 
-	private String transformationId;
+	private String transformationUID;
+	private String userHash;
 
 	public StreamNode(StreamExecutionEnvironment env,
 		Integer id,
 		String slotSharingGroup,
+		@Nullable String coLocationGroup,
 		StreamOperator<?> operator,
 		String operatorName,
 		List<OutputSelector<?>> outputSelector,
 		Class<? extends AbstractInvokable> jobVertexClass) {
+
 		this.env = env;
 		this.id = id;
 		this.operatorName = operatorName;
@@ -85,6 +93,7 @@ public class StreamNode implements Serializable {
 		this.outputSelectors = outputSelector;
 		this.jobVertexClass = jobVertexClass;
 		this.slotSharingGroup = slotSharingGroup;
+		this.coLocationGroup = coLocationGroup;
 	}
 
 	public void addInEdge(StreamEdge inEdge) {
@@ -162,8 +171,20 @@ public class StreamNode implements Serializable {
 	 * @param maxParallelism Maximum parallelism to be set
 	 */
 	void setMaxParallelism(int maxParallelism) {
-		Preconditions.checkArgument(maxParallelism > 0, "The maximum parallelism must be at least 1.");
 		this.maxParallelism = maxParallelism;
+	}
+
+	public ResourceSpec getMinResources() {
+		return minResources;
+	}
+
+	public ResourceSpec getPreferredResources() {
+		return preferredResources;
+	}
+
+	public void setResources(ResourceSpec minResources, ResourceSpec preferredResources) {
+		this.minResources = minResources;
+		this.preferredResources = preferredResources;
 	}
 
 	public Long getBufferTimeout() {
@@ -238,6 +259,14 @@ public class StreamNode implements Serializable {
 		return slotSharingGroup;
 	}
 
+	public void setCoLocationGroup(@Nullable String coLocationGroup) {
+		this.coLocationGroup = coLocationGroup;
+	}
+
+	public @Nullable String getCoLocationGroup() {
+		return coLocationGroup;
+	}
+
 	public boolean isSameSlotSharingGroup(StreamNode downstreamVertex) {
 		return (slotSharingGroup == null && downstreamVertex.slotSharingGroup == null) ||
 				(slotSharingGroup != null && slotSharingGroup.equals(downstreamVertex.slotSharingGroup));
@@ -272,12 +301,20 @@ public class StreamNode implements Serializable {
 		this.stateKeySerializer = stateKeySerializer;
 	}
 
-	String getTransformationId() {
-		return transformationId;
+	public String getTransformationUID() {
+		return transformationUID;
 	}
 
-	void setTransformationId(String transformationId) {
-		this.transformationId = transformationId;
+	void setTransformationUID(String transformationId) {
+		this.transformationUID = transformationId;
+	}
+
+	public String getUserHash() {
+		return userHash;
+	}
+
+	public void setUserHash(String userHash) {
+		this.userHash = userHash;
 	}
 
 	@Override

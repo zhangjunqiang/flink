@@ -18,31 +18,35 @@
 
 package org.apache.flink.runtime.util;
 
-import akka.actor.ActorRef;
-import akka.actor.ActorSystem;
-import akka.dispatch.Mapper;
-import akka.dispatch.OnComplete;
-import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.HighAvailabilityOptions;
 import org.apache.flink.configuration.IllegalConfigurationException;
 import org.apache.flink.runtime.akka.AkkaUtils;
+import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.instance.ActorGateway;
 import org.apache.flink.runtime.instance.AkkaActorGateway;
 import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalException;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalListener;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
-import org.apache.flink.runtime.leaderretrieval.StandaloneLeaderRetrievalService;
 import org.apache.flink.runtime.net.ConnectionUtils;
+import org.apache.flink.util.FlinkException;
+
+import akka.actor.ActorRef;
+import akka.actor.ActorSystem;
+import akka.dispatch.Mapper;
+import akka.dispatch.OnComplete;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.net.InetAddress;
+import java.util.UUID;
+
 import scala.concurrent.Await;
 import scala.concurrent.Future;
 import scala.concurrent.Promise;
 import scala.concurrent.duration.FiniteDuration;
-
-import java.net.InetAddress;
-import java.util.UUID;
 
 /**
  * Utility class to work with {@link LeaderRetrievalService} class.
@@ -50,54 +54,6 @@ import java.util.UUID;
 public class LeaderRetrievalUtils {
 
 	private static final Logger LOG = LoggerFactory.getLogger(LeaderRetrievalUtils.class);
-
-	/**
-	 * Creates a {@link LeaderRetrievalService} based on the provided {@link Configuration} object.
-	 *
-	 * @param configuration Configuration containing the settings for the {@link LeaderRetrievalService}
-	 * @return The {@link LeaderRetrievalService} specified in the configuration object
-	 * @throws Exception
-	 */
-	public static LeaderRetrievalService createLeaderRetrievalService(Configuration configuration)
-		throws Exception {
-
-		HighAvailabilityMode highAvailabilityMode = getRecoveryMode(configuration);
-
-		switch (highAvailabilityMode) {
-			case NONE:
-				return StandaloneUtils.createLeaderRetrievalService(configuration);
-			case ZOOKEEPER:
-				return ZooKeeperUtils.createLeaderRetrievalService(configuration);
-			default:
-				throw new Exception("Recovery mode " + highAvailabilityMode + " is not supported.");
-		}
-	}
-
-	/**
-	 * Creates a {@link LeaderRetrievalService} that either uses the distributed leader election
-	 * configured in the configuration, or, in standalone mode, the given actor reference.
-	 *
-	 * @param configuration Configuration containing the settings for the {@link LeaderRetrievalService}
-	 * @param standaloneRef Actor reference to be used in standalone mode. 
-	 *                      
-	 * @return The {@link LeaderRetrievalService} specified in the configuration object
-	 * @throws Exception
-	 */
-	public static LeaderRetrievalService createLeaderRetrievalService(
-				Configuration configuration, ActorRef standaloneRef) throws Exception {
-
-		HighAvailabilityMode highAvailabilityMode = getRecoveryMode(configuration);
-
-		switch (highAvailabilityMode) {
-			case NONE:
-				String akkaUrl = standaloneRef.path().toSerializationFormat();
-				return new StandaloneLeaderRetrievalService(akkaUrl);
-			case ZOOKEEPER:
-				return ZooKeeperUtils.createLeaderRetrievalService(configuration);
-			default:
-				throw new Exception("Recovery mode " + highAvailabilityMode + " is not supported.");
-		}
-	}
 	
 	/**
 	 * Retrieves the current leader gateway using the given {@link LeaderRetrievalService}. If the
@@ -124,7 +80,7 @@ public class LeaderRetrievalUtils {
 
 			return Await.result(actorGatewayFuture, timeout);
 		} catch (Exception e) {
-			throw new LeaderRetrievalException("Could not retrieve the leader gateway", e);
+			throw new LeaderRetrievalException("Could not retrieve the leader gateway.", e);
 		} finally {
 			try {
 				leaderRetrievalService.stop();
@@ -132,6 +88,23 @@ public class LeaderRetrievalUtils {
 				LOG.warn("Could not stop the leader retrieval service.", fe);
 			}
 		}
+	}
+
+	/**
+	 * Retrieves the leader akka url and the current leader session ID. The values are stored in a
+	 * {@link LeaderConnectionInfo} instance.
+	 *
+	 * @param leaderRetrievalService Leader retrieval service to retrieve the leader connection
+	 *                               information
+	 * @param timeout Timeout when to give up looking for the leader
+	 * @return LeaderConnectionInfo containing the leader's akka URL and the current leader session
+	 * ID
+	 * @throws LeaderRetrievalException
+	 */
+	public static LeaderConnectionInfo retrieveLeaderConnectionInfo(
+			LeaderRetrievalService leaderRetrievalService,
+			Time timeout) throws LeaderRetrievalException {
+		return retrieveLeaderConnectionInfo(leaderRetrievalService, FutureUtils.toFiniteDuration(timeout));
 	}
 
 	/**
@@ -167,6 +140,27 @@ public class LeaderRetrievalUtils {
 				LOG.warn("Could not stop the leader retrieval service.", fe);
 			}
 		}
+	}
+
+	/**
+	 * Retrieves the current leader session id of the component identified by the given leader
+	 * retrieval service.
+	 *
+	 * @param leaderRetrievalService Leader retrieval service to be used for the leader retrieval
+	 * @param timeout Timeout for the leader retrieval
+	 * @return The leader session id of the retrieved leader
+	 * @throws LeaderRetrievalException if the leader retrieval operation fails (including a timeout)
+	 */
+	public static UUID retrieveLeaderSessionId(
+			LeaderRetrievalService leaderRetrievalService,
+			FiniteDuration timeout) throws LeaderRetrievalException {
+		return retrieveLeaderConnectionInfo(leaderRetrievalService, timeout).getLeaderSessionID();
+	}
+
+	public static InetAddress findConnectingAddress(
+			LeaderRetrievalService leaderRetrievalService,
+			Time timeout) throws LeaderRetrievalException {
+		return findConnectingAddress(leaderRetrievalService, new FiniteDuration(timeout.getSize(), timeout.getUnit()));
 	}
 
 	public static InetAddress findConnectingAddress(
@@ -268,8 +262,14 @@ public class LeaderRetrievalUtils {
 
 		@Override
 		public void notifyLeaderAddress(String leaderAddress, UUID leaderSessionID) {
-			if(leaderAddress != null && !leaderAddress.equals("") && !connectionInfo.isCompleted()) {
-				connectionInfo.success(new LeaderConnectionInfo(leaderAddress, leaderSessionID));
+			if (leaderAddress != null && !leaderAddress.equals("") && !connectionInfo.isCompleted()) {
+				try {
+					final LeaderConnectionInfo leaderConnectionInfo = new LeaderConnectionInfo(leaderAddress, leaderSessionID);
+					connectionInfo.success(leaderConnectionInfo);
+				} catch (FlinkException e) {
+					connectionInfo.failure(e);
+				}
+
 			}
 		}
 
@@ -282,8 +282,7 @@ public class LeaderRetrievalUtils {
 	}
 
 	/**
-	 * Gets the recovery mode as configured, based on the {@link ConfigConstants#HA_MODE}
-	 * config key.
+	 * Gets the recovery mode as configured, based on {@link HighAvailabilityOptions#HA_MODE}.
 	 * 
 	 * @param config The configuration to read the recovery mode from.
 	 * @return The recovery mode.

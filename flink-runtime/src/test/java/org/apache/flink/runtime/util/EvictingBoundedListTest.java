@@ -31,6 +31,9 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+/**
+ * Tests for {@link EvictingBoundedList}.
+ */
 public class EvictingBoundedListTest {
 
 	@Test
@@ -114,7 +117,7 @@ public class EvictingBoundedListTest {
 		try {
 			list.get(0);
 			fail();
-		} catch (IllegalArgumentException ignore) {
+		} catch (IndexOutOfBoundsException ignore) {
 		}
 	}
 

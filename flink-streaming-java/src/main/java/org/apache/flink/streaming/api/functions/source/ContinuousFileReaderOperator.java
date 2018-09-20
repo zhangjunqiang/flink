@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.streaming.api.functions.source;
 
 import org.apache.flink.annotation.Internal;
@@ -34,6 +35,7 @@ import org.apache.flink.streaming.api.operators.OutputTypeConfigurable;
 import org.apache.flink.streaming.api.operators.StreamSourceContexts;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,15 +46,15 @@ import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Queue;
 
-import static org.apache.flink.util.Preconditions.checkState;
 import static org.apache.flink.util.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * The operator that reads the {@link TimestampedFileInputSplit splits} received from the preceding
  * {@link ContinuousFileMonitoringFunction}. Contrary to the {@link ContinuousFileMonitoringFunction}
  * which has a parallelism of 1, this operator can have DOP > 1.
- * <p/>
- * As soon as a split descriptor is received, it is put in a queue, and have another
+ *
+ * <p>As soon as a split descriptor is received, it is put in a queue, and have another
  * thread read the actual data of the split. This architecture allows the separation of the
  * reading thread from the one emitting the checkpoint barriers, thus removing any potential
  * back-pressure.
@@ -73,8 +75,8 @@ public class ContinuousFileReaderOperator<OUT> extends AbstractStreamOperator<OU
 	private transient SplitReader<OUT> reader;
 	private transient SourceFunction.SourceContext<OUT> readerContext;
 
-	private ListState<TimestampedFileInputSplit> checkpointedState;
-	private List<TimestampedFileInputSplit> restoredReaderState;
+	private transient ListState<TimestampedFileInputSplit> checkpointedState;
+	private transient List<TimestampedFileInputSplit> restoredReaderState;
 
 	public ContinuousFileReaderOperator(FileInputFormat<OUT> format) {
 		this.format = checkNotNull(format);
@@ -89,25 +91,27 @@ public class ContinuousFileReaderOperator<OUT> extends AbstractStreamOperator<OU
 	public void initializeState(StateInitializationContext context) throws Exception {
 		super.initializeState(context);
 
-		checkState(this.checkpointedState == null && this.restoredReaderState == null,
-			"The reader state has already been initialized.");
+		checkState(checkpointedState == null,	"The reader state has already been initialized.");
 
-		checkpointedState = context.getManagedOperatorStateStore().getSerializableListState("splits");
+		checkpointedState = context.getOperatorStateStore().getSerializableListState("splits");
 
 		int subtaskIdx = getRuntimeContext().getIndexOfThisSubtask();
 		if (context.isRestored()) {
-			LOG.info("Restoring state for the ContinuousFileReaderOperator (taskIdx={}).", subtaskIdx);
+			LOG.info("Restoring state for the {} (taskIdx={}).", getClass().getSimpleName(), subtaskIdx);
 
-			this.restoredReaderState = new ArrayList<>();
-			for (TimestampedFileInputSplit split : this.checkpointedState.get()) {
-				this.restoredReaderState.add(split);
-			}
+			// this may not be null in case we migrate from a previous Flink version.
+			if (restoredReaderState == null) {
+				restoredReaderState = new ArrayList<>();
+				for (TimestampedFileInputSplit split : checkpointedState.get()) {
+					restoredReaderState.add(split);
+				}
 
-			if (LOG.isDebugEnabled()) {
-				LOG.debug("ContinuousFileReaderOperator idx {} restored {}.", subtaskIdx, this.restoredReaderState);
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("{} (taskIdx={}) restored {}.", getClass().getSimpleName(), subtaskIdx, restoredReaderState);
+				}
 			}
 		} else {
-			LOG.info("No state to restore for the ContinuousFileReaderOperator (taskIdx={}).", subtaskIdx);
+			LOG.info("No state to restore for the {} (taskIdx={}).", getClass().getSimpleName(), subtaskIdx);
 		}
 	}
 
@@ -127,7 +131,13 @@ public class ContinuousFileReaderOperator<OUT> extends AbstractStreamOperator<OU
 		final TimeCharacteristic timeCharacteristic = getOperatorConfig().getTimeCharacteristic();
 		final long watermarkInterval = getRuntimeContext().getExecutionConfig().getAutoWatermarkInterval();
 		this.readerContext = StreamSourceContexts.getSourceContext(
-			timeCharacteristic, getProcessingTimeService(), checkpointLock, output, watermarkInterval);
+			timeCharacteristic,
+			getProcessingTimeService(),
+			checkpointLock,
+			getContainingTask().getStreamStatusMaintainer(),
+			output,
+			watermarkInterval,
+			-1);
 
 		// and initialize the split reading thread
 		this.reader = new SplitReader<>(format, serializer, readerContext, checkpointLock, restoredReaderState);
@@ -186,11 +196,14 @@ public class ContinuousFileReaderOperator<OUT> extends AbstractStreamOperator<OU
 	public void close() throws Exception {
 		super.close();
 
+		// make sure that we hold the checkpointing lock
+		Thread.holdsLock(checkpointLock);
+
 		// close the reader to signal that no more splits will come. By doing this,
 		// the reader will exit as soon as it finishes processing the already pending splits.
 		// This method will wait until then. Further cleaning up is handled by the dispose().
 
-		if (reader != null && reader.isAlive() && reader.isRunning()) {
+		while (reader != null && reader.isAlive() && reader.isRunning()) {
 			reader.close();
 			checkpointLock.wait();
 		}
@@ -352,7 +365,7 @@ public class ContinuousFileReaderOperator<OUT> extends AbstractStreamOperator<OU
 
 		private List<TimestampedFileInputSplit> getReaderState() throws IOException {
 			List<TimestampedFileInputSplit> snapshot = new ArrayList<>(this.pendingSplits.size());
-			if (currentSplit != null ) {
+			if (currentSplit != null) {
 				if (this.format instanceof CheckpointableInputFormat && this.isSplitOpen) {
 					Serializable formatState =
 						((CheckpointableInputFormat<TimestampedFileInputSplit, Serializable>) this.format).getCurrentState();
@@ -379,20 +392,30 @@ public class ContinuousFileReaderOperator<OUT> extends AbstractStreamOperator<OU
 	public void snapshotState(StateSnapshotContext context) throws Exception {
 		super.snapshotState(context);
 
-		checkState(this.checkpointedState != null,
+		checkState(checkpointedState != null,
 			"The operator state has not been properly initialized.");
 
 		int subtaskIdx = getRuntimeContext().getIndexOfThisSubtask();
 
-		this.checkpointedState.clear();
-		List<TimestampedFileInputSplit> readerState = this.reader.getReaderState();
-		for (TimestampedFileInputSplit split : readerState) {
-			// create a new partition for each entry.
-			this.checkpointedState.add(split);
+		checkpointedState.clear();
+
+		List<TimestampedFileInputSplit> readerState = reader.getReaderState();
+
+		try {
+			for (TimestampedFileInputSplit split : readerState) {
+				// create a new partition for each entry.
+				checkpointedState.add(split);
+			}
+		} catch (Exception e) {
+			checkpointedState.clear();
+
+			throw new Exception("Could not add timestamped file input splits to to operator " +
+				"state backend of operator " + getOperatorName() + '.', e);
 		}
 
 		if (LOG.isDebugEnabled()) {
-			LOG.debug("ContinuousFileReaderOperator idx {} checkpointed {}.", subtaskIdx, readerState);
+			LOG.debug("{} (taskIdx={}) checkpointed {} splits: {}.",
+				getClass().getSimpleName(), subtaskIdx, readerState.size(), readerState);
 		}
 	}
 }

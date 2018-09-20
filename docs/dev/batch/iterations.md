@@ -1,9 +1,7 @@
 ---
-title:  "Iterations"
-
-# Sub-level navigation
-sub-nav-group: batch
-sub-nav-pos: 3
+title: Iterations
+nav-parent_id: batch
+nav-pos: 2
 ---
 <!--
 Licensed to the Apache Software Foundation (ASF) under one
@@ -104,7 +102,7 @@ There are multiple options to specify **termination conditions** for an iteratio
 
 You can also think about the iterate operator in pseudo-code:
 
-~~~java
+{% highlight java %}
 IterationState state = getInitialState();
 
 while (!terminationCriterion()) {
@@ -112,7 +110,7 @@ while (!terminationCriterion()) {
 }
 
 setFinalState(state);
-~~~
+{% endhighlight %}
 
 <div class="panel panel-default">
 	<div class="panel-body">
@@ -121,25 +119,25 @@ setFinalState(state);
 
 ### Example: Incrementing Numbers
 
-In the following example, we **iteratively incremenet a set numbers**:
+In the following example, we **iteratively increment a set numbers**:
 
 <p class="text-center">
     <img alt="Iterate Operator Example" width="60%" src="{{site.baseurl}}/fig/iterations_iterate_operator_example.png" />
 </p>
 
-  1. **Iteration Input**: The inital input is read from a data source and consists of five single-field records (integers `1` to `5`).
+  1. **Iteration Input**: The initial input is read from a data source and consists of five single-field records (integers `1` to `5`).
   2. **Step function**: The step function is a single `map` operator, which increments the integer field from `i` to `i+1`. It will be applied to every record of the input.
   3. **Next Partial Solution**: The output of the step function will be the output of the map operator, i.e. records with incremented integers.
   4. **Iteration Result**: After ten iterations, the initial numbers will have been incremented ten times, resulting in integers `11` to `15`.
 
-~~~
+{% highlight plain %}
 // 1st           2nd                       10th
 map(1) -> 2      map(2) -> 3      ...      map(10) -> 11
 map(2) -> 3      map(3) -> 4      ...      map(11) -> 12
 map(3) -> 4      map(4) -> 5      ...      map(12) -> 13
 map(4) -> 5      map(5) -> 6      ...      map(13) -> 14
 map(5) -> 6      map(6) -> 7      ...      map(14) -> 15
-~~~
+{% endhighlight %}
 
 Note that **1**, **2**, and **4** can be arbitrary data flows.
 
@@ -164,7 +162,7 @@ The default **termination condition** for delta iterations is specified by the *
 
 You can also think about the iterate operator in pseudo-code:
 
-~~~java
+{% highlight java %}
 IterationState workset = getInitialState();
 IterationState solution = getInitialSolution();
 
@@ -175,7 +173,7 @@ while (!terminationCriterion()) {
 }
 
 setFinalState(solution);
-~~~
+{% endhighlight %}
 
 <div class="panel panel-default">
 	<div class="panel-body">
@@ -210,3 +208,5 @@ We referred to each execution of the step function of an iteration operator as *
 <p class="text-center">
     <img alt="Supersteps" width="50%" src="{{site.baseurl}}/fig/iterations_supersteps.png" />
 </p>
+
+{% top %}

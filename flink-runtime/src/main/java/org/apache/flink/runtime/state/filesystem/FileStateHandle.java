@@ -31,7 +31,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * {@link StreamStateHandle} for state that was written to a file stream. The written data is
- * identifier by the file path. The state can be read again by calling {@link #openInputStream()}.
+ * identified by the file path. The state can be read again by calling {@link #openInputStream()}.
  */
 public class FileStateHandle implements StreamStateHandle {
 
@@ -76,27 +76,17 @@ public class FileStateHandle implements StreamStateHandle {
 	 */
 	@Override
 	public void discardState() throws Exception {
-
 		FileSystem fs = getFileSystem();
-
 		fs.delete(filePath, false);
-
-		// send a call to delete the checkpoint directory containing the file. This will
-		// fail (and be ignored) when some files still exist
-		try {
-			fs.delete(filePath.getParent(), false);
-		} catch (IOException ignored) {
-		}
 	}
 
 	/**
 	 * Returns the file size in bytes.
 	 *
 	 * @return The file size in bytes.
-	 * @throws IOException Thrown if the file system cannot be accessed.
 	 */
 	@Override
-	public long getStateSize() throws IOException {
+	public long getStateSize() {
 		return stateSize;
 	}
 

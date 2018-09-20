@@ -44,7 +44,6 @@ import org.apache.flink.util.Collector;
 import org.junit.Assert;
 import org.junit.Test;
 
-
 public class ChainTaskTest extends TaskTestBase {
 	
 	private static final int MEMORY_MANAGER_SIZE = 1024 * 1024 * 3;
@@ -97,9 +96,8 @@ public class ChainTaskTest extends TaskTestBase {
 			
 			// chained map+combine
 			{
-				BatchTask<FlatMapFunction<Record, Record>, Record> testTask =
-											new BatchTask<>();
-				registerTask(testTask, FlatMapDriver.class, MockMapStub.class);
+				registerTask(FlatMapDriver.class, MockMapStub.class);
+				BatchTask<FlatMapFunction<Record, Record>, Record> testTask = new BatchTask<>(this.mockEnv);
 				
 				try {
 					testTask.invoke();
@@ -158,19 +156,16 @@ public class ChainTaskTest extends TaskTestBase {
 			
 			// chained map+combine
 			{
-				final BatchTask<FlatMapFunction<Record, Record>, Record> testTask =
-											new BatchTask<>();
-				
-				super.registerTask(testTask, FlatMapDriver.class, MockMapStub.class);
-	
+				registerTask(FlatMapDriver.class, MockMapStub.class);
+				final BatchTask<FlatMapFunction<Record, Record>, Record> testTask = new BatchTask<>(this.mockEnv);
+
 				boolean stubFailed = false;
-				
 				try {
 					testTask.invoke();
 				} catch (Exception e) {
 					stubFailed = true;
 				}
-				
+
 				Assert.assertTrue("Function exception was not forwarded.", stubFailed);
 			}
 		}
