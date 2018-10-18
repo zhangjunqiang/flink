@@ -38,6 +38,14 @@ object FlinkRuleSets {
     SubQueryRemoveRule.JOIN)
 
   /**
+    * Handles proper conversion of correlate queries with temporal table functions
+    * into temporal table joins. This can create new table scans in the plan.
+    */
+  val TEMPORAL_JOIN_RULES: RuleSet = RuleSets.ofList(
+    LogicalCorrelateToTemporalTableJoinRule.INSTANCE
+  )
+
+  /**
     * Convert table references before query decorrelation.
     */
   val TABLE_REF_RULES: RuleSet = RuleSets.ofList(
@@ -127,6 +135,7 @@ object FlinkRuleSets {
     FlinkLogicalCorrelate.CONVERTER,
     FlinkLogicalIntersect.CONVERTER,
     FlinkLogicalJoin.CONVERTER,
+    FlinkLogicalTemporalTableJoin.CONVERTER,
     FlinkLogicalMinus.CONVERTER,
     FlinkLogicalSort.CONVERTER,
     FlinkLogicalUnion.CONVERTER,
@@ -155,7 +164,11 @@ object FlinkRuleSets {
     WindowPropertiesHavingRule.INSTANCE,
 
     // expand distinct aggregate to normal aggregate with groupby
-    AggregateExpandDistinctAggregatesRule.JOIN
+    AggregateExpandDistinctAggregatesRule.JOIN,
+
+    // merge a cascade of predicates to IN or NOT_IN
+    ConvertToNotInOrInRule.IN_INSTANCE,
+    ConvertToNotInOrInRule.NOT_IN_INSTANCE
   )
 
   /**
@@ -192,7 +205,11 @@ object FlinkRuleSets {
     ReduceExpressionsRule.FILTER_INSTANCE,
     ReduceExpressionsRule.PROJECT_INSTANCE,
     ReduceExpressionsRule.CALC_INSTANCE,
-    ProjectToWindowRule.PROJECT
+    ProjectToWindowRule.PROJECT,
+
+    // merge a cascade of predicates to IN or NOT_IN
+    ConvertToNotInOrInRule.IN_INSTANCE,
+    ConvertToNotInOrInRule.NOT_IN_INSTANCE
   )
 
   /**
@@ -211,6 +228,7 @@ object FlinkRuleSets {
     DataStreamCorrelateRule.INSTANCE,
     DataStreamWindowJoinRule.INSTANCE,
     DataStreamJoinRule.INSTANCE,
+    DataStreamTemporalTableJoinRule.INSTANCE,
     StreamTableSourceScanRule.INSTANCE
   )
 

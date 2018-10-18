@@ -57,9 +57,13 @@ class TupleSerializerCompatibilityTest {
       assertTrue(oldSerializer.isInstanceOf[CaseClassSerializer[_]])
       assertTrue(oldConfigSnapshot.isInstanceOf[TupleSerializerConfigSnapshot[_]])
 
+      assertTrue(oldConfigSnapshot.isInstanceOf[TupleSerializerConfigSnapshot[_]])
+
       val currentSerializer = createTypeInformation[TestCaseClass]
         .createSerializer(new ExecutionConfig())
-      assertFalse(currentSerializer.ensureCompatibility(oldConfigSnapshot).isRequiresMigration)
+      assertFalse(currentSerializer
+        .ensureCompatibility(oldConfigSnapshot)
+        .isRequiresMigration)
 
       // test old data serialization
       is.close()

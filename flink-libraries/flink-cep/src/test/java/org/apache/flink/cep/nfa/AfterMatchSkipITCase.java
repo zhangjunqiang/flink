@@ -24,6 +24,7 @@ import org.apache.flink.cep.pattern.Pattern;
 import org.apache.flink.cep.pattern.conditions.IterativeCondition;
 import org.apache.flink.cep.pattern.conditions.SimpleCondition;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.TestLogger;
 
 import org.apache.flink.shaded.guava18.com.google.common.collect.Lists;
@@ -44,7 +45,7 @@ import static org.apache.flink.cep.utils.NFAUtils.compile;
 public class AfterMatchSkipITCase extends TestLogger{
 
 	@Test
-	public void testSkipToNext() throws Exception {
+	public void testNoSkip() throws Exception {
 		List<StreamRecord<Event>> streamEvents = new ArrayList<>();
 
 		Event a1 = new Event(1, "a", 0.0);
@@ -80,6 +81,121 @@ public class AfterMatchSkipITCase extends TestLogger{
 			Lists.newArrayList(a3, a4, a5),
 			Lists.newArrayList(a4, a5, a6)
 		));
+	}
+
+	@Test
+	public void testNoSkipWithFollowedByAny() throws Exception {
+		List<List<Event>> resultingPatterns = TwoVariablesFollowedByAny.compute(AfterMatchSkipStrategy.noSkip());
+
+		compareMaps(resultingPatterns, Lists.newArrayList(
+			Lists.newArrayList(TwoVariablesFollowedByAny.a1, TwoVariablesFollowedByAny.b1),
+			Lists.newArrayList(TwoVariablesFollowedByAny.a1, TwoVariablesFollowedByAny.b2),
+			Lists.newArrayList(TwoVariablesFollowedByAny.a2, TwoVariablesFollowedByAny.b2)
+		));
+	}
+
+	@Test
+	public void testSkipToNextWithFollowedByAny() throws Exception {
+		List<List<Event>> resultingPatterns = TwoVariablesFollowedByAny.compute(AfterMatchSkipStrategy.skipToNext());
+
+		compareMaps(resultingPatterns, Lists.newArrayList(
+			Lists.newArrayList(TwoVariablesFollowedByAny.a1, TwoVariablesFollowedByAny.b1),
+			Lists.newArrayList(TwoVariablesFollowedByAny.a2, TwoVariablesFollowedByAny.b2)
+		));
+	}
+
+	static class TwoVariablesFollowedByAny {
+
+		static Event a1 = new Event(1, "a", 0.0);
+		static Event b1 = new Event(2, "b", 0.0);
+		static Event a2 = new Event(4, "a", 0.0);
+		static Event b2 = new Event(5, "b", 0.0);
+
+		private static List<List<Event>> compute(AfterMatchSkipStrategy skipStrategy) throws Exception {
+			List<StreamRecord<Event>> streamEvents = new ArrayList<>();
+
+			streamEvents.add(new StreamRecord<>(a1));
+			streamEvents.add(new StreamRecord<>(b1));
+			streamEvents.add(new StreamRecord<>(a2));
+			streamEvents.add(new StreamRecord<>(b2));
+
+			Pattern<Event, ?> pattern = Pattern.<Event>begin("start")
+				.where(new SimpleCondition<Event>() {
+
+					@Override
+					public boolean filter(Event value) throws Exception {
+						return value.getName().equals("a");
+					}
+				}).followedByAny("end")
+				.where(new SimpleCondition<Event>() {
+
+					@Override
+					public boolean filter(Event value) throws Exception {
+						return value.getName().equals("b");
+					}
+				});
+
+			NFA<Event> nfa = compile(pattern, false);
+
+			return feedNFA(streamEvents, nfa, skipStrategy);
+		}
+	}
+
+	@Test
+	public void testNoSkipWithQuantifierAtTheEnd() throws Exception {
+		List<List<Event>> resultingPatterns = QuantifierAtEndOfPattern.compute(AfterMatchSkipStrategy.noSkip());
+
+		compareMaps(resultingPatterns, Lists.newArrayList(
+			Lists.newArrayList(QuantifierAtEndOfPattern.a1, QuantifierAtEndOfPattern.b1,  QuantifierAtEndOfPattern.b2,  QuantifierAtEndOfPattern.b3),
+			Lists.newArrayList(QuantifierAtEndOfPattern.a1, QuantifierAtEndOfPattern.b1,  QuantifierAtEndOfPattern.b2),
+			Lists.newArrayList(QuantifierAtEndOfPattern.a1, QuantifierAtEndOfPattern.b1)
+		));
+	}
+
+	@Test
+	public void testSkipToNextWithQuantifierAtTheEnd() throws Exception {
+		List<List<Event>> resultingPatterns = QuantifierAtEndOfPattern.compute(AfterMatchSkipStrategy.skipToNext());
+
+		compareMaps(resultingPatterns, Lists.<List<Event>>newArrayList(
+			Lists.newArrayList(QuantifierAtEndOfPattern.a1, QuantifierAtEndOfPattern.b1)
+		));
+	}
+
+	static class QuantifierAtEndOfPattern {
+
+		static Event a1 = new Event(1, "a", 0.0);
+		static Event b1 = new Event(2, "b", 0.0);
+		static Event b2 = new Event(4, "b", 0.0);
+		static Event b3 = new Event(5, "b", 0.0);
+
+		private static List<List<Event>> compute(AfterMatchSkipStrategy skipStrategy) throws Exception {
+			List<StreamRecord<Event>> streamEvents = new ArrayList<>();
+
+			streamEvents.add(new StreamRecord<>(a1));
+			streamEvents.add(new StreamRecord<>(b1));
+			streamEvents.add(new StreamRecord<>(b2));
+			streamEvents.add(new StreamRecord<>(b3));
+
+			Pattern<Event, ?> pattern = Pattern.<Event>begin("start")
+				.where(new SimpleCondition<Event>() {
+
+					@Override
+					public boolean filter(Event value) throws Exception {
+						return value.getName().equals("a");
+					}
+				}).next("end")
+				.where(new SimpleCondition<Event>() {
+
+					@Override
+					public boolean filter(Event value) throws Exception {
+						return value.getName().equals("b");
+					}
+				}).oneOrMore();
+
+			NFA<Event> nfa = compile(pattern, false);
+
+			return feedNFA(streamEvents, nfa, skipStrategy);
+		}
 	}
 
 	@Test
@@ -430,6 +546,74 @@ public class AfterMatchSkipITCase extends TestLogger{
 			Lists.newArrayList(a2, b2),
 			Lists.newArrayList(a3, b4)
 		));
+	}
+
+	@Test(expected = FlinkRuntimeException.class)
+	public void testSkipToFirstNonExistentPosition() throws Exception {
+		MissedSkipTo.compute(AfterMatchSkipStrategy.skipToFirst("b").throwExceptionOnMiss());
+
+		//exception should be thrown
+	}
+
+	@Test
+	public void testSkipToFirstNonExistentPositionWithoutException() throws Exception {
+		List<List<Event>> resultingPatterns = MissedSkipTo.compute(AfterMatchSkipStrategy.skipToFirst("b"));
+
+		compareMaps(resultingPatterns, Collections.singletonList(
+			Lists.newArrayList(MissedSkipTo.a, MissedSkipTo.c)
+		));
+	}
+
+	@Test(expected = FlinkRuntimeException.class)
+	public void testSkipToLastNonExistentPosition() throws Exception {
+		MissedSkipTo.compute(AfterMatchSkipStrategy.skipToLast("b").throwExceptionOnMiss());
+
+		//exception should be thrown
+	}
+
+	@Test
+	public void testSkipToLastNonExistentPositionWithoutException() throws Exception {
+		List<List<Event>> resultingPatterns = MissedSkipTo.compute(AfterMatchSkipStrategy.skipToFirst("b"));
+
+		compareMaps(resultingPatterns, Collections.singletonList(
+			Lists.newArrayList(MissedSkipTo.a, MissedSkipTo.c)
+		));
+	}
+
+	static class MissedSkipTo {
+		static Event a = new Event(1, "a", 0.0);
+		static Event c = new Event(4, "c", 0.0);
+
+		static List<List<Event>> compute(AfterMatchSkipStrategy skipStrategy) throws Exception {
+			List<StreamRecord<Event>> streamEvents = new ArrayList<>();
+
+			streamEvents.add(new StreamRecord<>(a));
+			streamEvents.add(new StreamRecord<>(c));
+
+			Pattern<Event, ?> pattern = Pattern.<Event>begin("a").where(
+				new SimpleCondition<Event>() {
+
+					@Override
+					public boolean filter(Event value) throws Exception {
+						return value.getName().contains("a");
+					}
+				}
+			).next("b").where(new SimpleCondition<Event>() {
+				@Override
+				public boolean filter(Event value) throws Exception {
+					return value.getName().contains("b");
+				}
+			}).oneOrMore().optional().consecutive()
+				.next("c").where(new SimpleCondition<Event>() {
+					@Override
+					public boolean filter(Event value) throws Exception {
+						return value.getName().contains("c");
+					}
+				});
+			NFA<Event> nfa = compile(pattern, false);
+
+			return feedNFA(streamEvents, nfa, skipStrategy);
+		}
 	}
 
 	@Test

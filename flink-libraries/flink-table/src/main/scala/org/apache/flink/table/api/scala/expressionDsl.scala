@@ -26,6 +26,7 @@ import org.apache.flink.table.api.{CurrentRange, CurrentRow, TableException, Unb
 import org.apache.flink.table.expressions.ExpressionUtils.{convertArray, toMilliInterval, toMonthInterval, toRowInterval}
 import org.apache.flink.table.api.Table
 import org.apache.flink.table.expressions.TimeIntervalUnit.TimeIntervalUnit
+import org.apache.flink.table.expressions.TimePointUnit.TimePointUnit
 import org.apache.flink.table.expressions._
 import org.apache.flink.table.functions.{AggregateFunction, DistinctAggregateFunction}
 
@@ -337,6 +338,11 @@ trait ImplicitExpressionOperations {
   def power(other: Expression) = Power(expr, other)
 
   /**
+    * Calculates the hyperbolic cosine of a given value.
+    */
+  def cosh() = Cosh(expr)
+
+  /**
     * Calculates the square root of a given value.
     */
   def sqrt() = Sqrt(expr)
@@ -471,6 +477,13 @@ trait ImplicitExpressionOperations {
   }
 
   /**
+    * Returns a new string which replaces all the occurrences of the search target
+    * with the replacement string (non-overlapping).
+    */
+  def replace(search: Expression, replacement: Expression) =
+    Replace(expr, search, replacement)
+
+  /**
     * Returns the length of a string.
     */
   def charLength() = CharLength(expr)
@@ -570,6 +583,18 @@ trait ImplicitExpressionOperations {
     */
   def regexpReplace(regex: Expression, replacement: Expression) =
     RegexpReplace(expr, regex, replacement)
+
+  /**
+    * Returns a string extracted with a specified regular expression and a regex match group index.
+    */
+  def regexpExtract(regex: Expression, extractIndex: Expression) =
+    RegexpExtract(expr, regex, extractIndex)
+
+  /**
+    * Returns a string extracted with a specified regular expression.
+    */
+  def regexpExtract(regex: Expression) =
+    RegexpExtract(expr, regex, null)
 
   /**
     * Returns the base string decoded with base64.
@@ -1138,6 +1163,34 @@ object dateFormat {
     format: Expression
   ): Expression = {
     DateFormat(timestamp, format)
+  }
+}
+
+/**
+  * Returns the (signed) number of [[TimePointUnit]] between timePoint1 and timePoint2.
+  *
+  * For example, timestampDiff(TimePointUnit.DAY, '2016-06-15'.toDate, '2016-06-18'.toDate leads
+  * to 3.
+  */
+object timestampDiff {
+
+  /**
+    * Returns the (signed) number of [[TimePointUnit]] between timePoint1 and timePoint2.
+    *
+    * For example, timestampDiff(TimePointUnit.DAY, '2016-06-15'.toDate, '2016-06-18'.toDate leads
+    * to 3.
+    *
+    * @param timePointUnit The unit to compute diff.
+    * @param timePoint1 The first point in time.
+    * @param timePoint2 The second point in time.
+    * @return The number of intervals as integer value.
+    */
+  def apply(
+      timePointUnit: TimePointUnit,
+      timePoint1: Expression,
+      timePoint2: Expression)
+    : Expression = {
+    TimestampDiff(timePointUnit, timePoint1, timePoint2)
   }
 }
 

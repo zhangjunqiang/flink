@@ -85,6 +85,14 @@ object ScalarSqlFunctions {
     SqlFunctionCategory.NUMERIC
   )
 
+  val COSH = new SqlFunction(
+    "COSH",
+    SqlKind.OTHER_FUNCTION,
+    ReturnTypes.DOUBLE_NULLABLE,
+    null,
+    OperandTypes.NUMERIC,
+    SqlFunctionCategory.NUMERIC)
+
   val LPAD = new SqlFunction(
     "LPAD",
     SqlKind.OTHER_FUNCTION,
@@ -194,6 +202,18 @@ object ScalarSqlFunctions {
       ReturnTypes.explicit(SqlTypeName.VARCHAR), SqlTypeTransforms.TO_NULLABLE),
     InferTypes.RETURN_TYPE,
     OperandTypes.STRING_STRING_STRING,
+    SqlFunctionCategory.STRING
+  )
+
+  val REGEXP_EXTRACT = new SqlFunction(
+    "REGEXP_EXTRACT",
+    SqlKind.OTHER_FUNCTION,
+    ReturnTypes.cascade(
+      ReturnTypes.explicit(SqlTypeName.VARCHAR), SqlTypeTransforms.FORCE_NULLABLE),
+    InferTypes.RETURN_TYPE,
+    OperandTypes.or(OperandTypes.STRING_STRING_INTEGER,
+      OperandTypes.STRING_STRING
+    ),
     SqlFunctionCategory.STRING
   )
 

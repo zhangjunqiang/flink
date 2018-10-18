@@ -97,10 +97,15 @@ public class CliClient {
 			.terminal(terminal)
 			.appName(CliStrings.CLI_NAME)
 			.parser(new SqlMultiLineParser())
+			.completer(new SqlCompleter(context, executor))
 			.build();
 		// this option is disabled for now for correct backslash escaping
 		// a "SELECT '\'" query should return a string with a backslash
 		lineReader.option(LineReader.Option.DISABLE_EVENT_EXPANSION, true);
+		// set strict "typo" distance between words when doing code completion
+		lineReader.setVariable(LineReader.ERRORS, 1);
+		// perform code completion case insensitive
+		lineReader.option(LineReader.Option.CASE_INSENSITIVE, true);
 
 		// create prompt
 		prompt = new AttributedStringBuilder()

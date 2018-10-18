@@ -222,6 +222,25 @@ public class LocalExecutorITCase extends TestLogger {
 		assertEquals(expectedTableSchema, actualTableSchema);
 	}
 
+	@Test
+	public void testCompleteStatement() throws Exception {
+		final Executor executor = createDefaultExecutor(clusterClient);
+		final SessionContext session = new SessionContext("test-session", new Environment());
+
+		final List<String> expectedTableHints = Arrays.asList(
+			"TABLE",
+			"TableNumber1",
+			"TableNumber2",
+			"TableSourceSink");
+		assertEquals(expectedTableHints, executor.completeStatement(session, "SELECT * FROM Ta", 16));
+
+		final List<String> expectedClause = Collections.singletonList("WHERE");
+		assertEquals(expectedClause, executor.completeStatement(session, "SELECT * FROM TableNumber2 WH", 29));
+
+		final List<String> expectedField = Arrays.asList("INTERVAL", "IntegerField1");
+		assertEquals(expectedField, executor.completeStatement(session, "SELECT * FROM TableNumber1 WHERE Inte", 37));
+	}
+
 	@Test(timeout = 30_000L)
 	public void testStreamQueryExecutionChangelog() throws Exception {
 		final URL url = getClass().getClassLoader().getResource("test-data.csv");
